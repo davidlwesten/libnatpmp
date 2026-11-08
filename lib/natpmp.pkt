@@ -42,8 +42,8 @@ message MapRequest {
 }
 
 // The header every response starts with (section 3.5). The body is decoded
-// separately: error responses aren't always complete, e.g. Unsupported Version
-// is only this header, and with the R bit clear.
+// separately, since its layout depends on the opcode, and Unsupported Version
+// is only this header, with the R bit clear.
 message ResponseHeader max 16 {
   version: u8 = 0;
   r: u1;
