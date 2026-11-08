@@ -1,0 +1,66 @@
+// NAT-PMP wire format (RFC 6886). Generates natpmp_gen.h and natpmp_gen.c with
+// pktc, see lib/CMakeLists.txt. Only covers what a client sends and receives:
+// external address and mapping requests, and their responses (including the
+// unsolicited address announcements).
+protocol natpmp;
+endian big;
+
+enum Opcode : u7 {
+  EXTERNAL_ADDRESS = 0,
+  MAP_UDP = 1,
+  MAP_TCP = 2,
+}
+
+// section 3.5. Open (it doesn't select a union branch), so codes the RFC
+// doesn't define still decode.
+enum Result : u16 {
+  SUCCESS = 0,
+  UNSUPPORTED_VERSION = 1,
+  NOT_AUTHORIZED = 2,
+  NETWORK_FAILURE = 3,
+  OUT_OF_RESOURCES = 4,
+  UNSUPPORTED_OPCODE = 5,
+}
+
+// section 3.2. The opcode is always EXTERNAL_ADDRESS, it's only a field
+// because pktc needs a message to store something.
+message AddressRequest {
+  version: u8 = 0;
+  r: u1 = 0;
+  opcode: Opcode;
+}
+
+// section 3.3, and 3.4 for deletes (lifetime 0)
+message MapRequest {
+  version: u8 = 0;
+  r: u1 = 0;
+  opcode: Opcode;
+  _: u16;
+  internal_port: u16;
+  external_port: u16;
+  lifetime: u32;
+}
+
+// The header every response starts with (section 3.5). The body is decoded
+// separately: error responses aren't always complete, e.g. Unsupported Version
+// is only this header, and with the R bit clear.
+message ResponseHeader max 16 {
+  version: u8 = 0;
+  r: u1;
+  opcode: Opcode;
+  result: Result;
+  epoch: u32;
+  body: u8[..];
+}
+
+// section 3.2, the body of an EXTERNAL_ADDRESS response
+message AddressResponse {
+  external_ip: u8[4];
+}
+
+// section 3.3, the body of a MAP_UDP or MAP_TCP response
+message MapResponse {
+  internal_port: u16;
+  external_port: u16;
+  lifetime: u32;
+}

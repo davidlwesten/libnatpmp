@@ -1,0 +1,2 @@
+lib/natpmp_gen.*
+test/natpmp_fuzz.c
