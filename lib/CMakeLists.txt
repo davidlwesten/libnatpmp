@@ -8,7 +8,11 @@ function(natpmp_add_library target)
   target_sources(${target}
     PRIVATE
       packet.c
+      retransmit.c
+      session.c
       natpmp_gen.c)
+
+  target_include_directories(${target} PUBLIC ${PROJECT_SOURCE_DIR}/include)
 
   target_link_libraries(${target} PRIVATE natpmp_warnings)
 endfunction()

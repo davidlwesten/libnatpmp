@@ -3,9 +3,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "address.h"
 #include "natpmp_gen.h"
 #include "view.h"
+#include <byo/natpmp/natpmp.h>
 
 // Reading and writing NAT-PMP packets on top of the generated codec,
 // with the rules the schema can't express
