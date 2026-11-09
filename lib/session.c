@@ -195,3 +195,8 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
     natpmp_session_request_done(session);
   }
 }
+
+void natpmp_session_on_unreachable(natpmp_session_t *session) {
+  assert(session);
+  natpmp_session_fail_all(session);
+}

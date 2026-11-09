@@ -81,9 +81,12 @@ receive(int fd, natpmp_session_t *session, natpmp_optional_time_ms_t deadline) {
   uint8_t data[64];
   ssize_t const size = recv(fd, data, sizeof(data), 0);
   if (size == -1) {
-    // e.g. ECONNREFUSED when nothing listens on the gateway, the
-    // retransmissions keep trying
-    perror("recv");
+    if (errno == ECONNREFUSED) {
+      // an ICMP Port Unreachable, nothing listens on the gateway
+      natpmp_session_on_unreachable(session);
+    } else {
+      perror("recv");
+    }
     return;
   }
 

@@ -271,6 +271,40 @@ static void test_session_queue_wraps() {
   natpmp_session_end(session);
 }
 
+static void test_session_unreachable() {
+  begin();
+  auto const first = request();
+  auto const second = request();
+  expect_send(0);
+
+  // no need to wait for the retransmissions, or to try the second
+  natpmp_session_on_unreachable(session);
+  expect_failed(10, first);
+  expect_failed(10, second);
+  expect_idle(10);
+  natpmp_session_end(session);
+}
+
+static void test_session_unreachable_before_sending() {
+  begin();
+
+  // nothing asked for
+  natpmp_session_on_unreachable(session);
+  expect_idle(0);
+
+  // or nothing sent yet
+  auto const handle = request();
+  natpmp_session_on_unreachable(session);
+  expect_failed(0, handle);
+  expect_idle(0);
+
+  // and later requests go out as usual
+  request();
+  expect_send(10);
+  expect_timeout(10, 260);
+  natpmp_session_end(session);
+}
+
 static void *counting_alloc(void *ctx, size_t size) {
   *(int *)ctx += 1;
   return malloc(size);
@@ -318,6 +352,8 @@ void session_tests() {
   RUN_TEST(test_session_queue_full);
   RUN_TEST(test_session_default_queue_size);
   RUN_TEST(test_session_queue_wraps);
+  RUN_TEST(test_session_unreachable);
+  RUN_TEST(test_session_unreachable_before_sending);
   RUN_TEST(test_session_allocator);
   RUN_TEST(test_session_out_of_memory);
 }

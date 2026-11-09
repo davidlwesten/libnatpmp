@@ -92,8 +92,8 @@ typedef struct natpmp_event {
     /// The gateway's external address is `address.external_ip`. This is the
     /// last event for the handle.
     NATPMP_EVENT_ADDRESS,
-    /// The gateway refused the request or didn't answer. This is the last
-    /// event for the handle.
+    /// The gateway refused the request, didn't answer, or couldn't be reached.
+    /// This is the last event for the handle.
     NATPMP_EVENT_FAILED,
     /// Nothing more to do before `timeout.deadline`, see natpmp_session_poll
     NATPMP_EVENT_TIMEOUT,
@@ -150,3 +150,16 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
 void natpmp_session_on_datagram(natpmp_session_t *session,
                                 size_t size,
                                 uint8_t const data[]);
+
+/**
+ * @brief Tell the session its requests can't reach the gateway
+ *
+ * For an ICMP Port Unreachable from the gateway, e.g. ECONNREFUSED from a
+ * connected socket. The gateway doesn't speak NAT-PMP then, so every queued
+ * request fails right away instead of after all the retransmissions.
+ *
+ * The application should poll the session afterwards, see natpmp_session_poll.
+ *
+ * @param[in] session The session to update
+ */
+void natpmp_session_on_unreachable(natpmp_session_t *session);
