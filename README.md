@@ -101,10 +101,12 @@ cmake --build build
 
 [pktc]: https://github.com/davidlwesten/pktc
 
-The example client takes the gateway's address or hostname:
+The example client takes the gateway's address or hostname, and optionally a
+port to map:
 
 ```sh
 ./build/example/natpmpc 192.168.1.1
+./build/example/natpmpc 192.168.1.1 tcp 8080
 ```
 
 ## License
