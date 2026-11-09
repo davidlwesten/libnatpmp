@@ -4,10 +4,9 @@
 #include <stdint.h>
 
 /**
- * @brief A point in time in milliseconds
+ * @brief Milliseconds from a monotonic clock like CLOCK_MONOTONIC
  *
- * Has to come from a monotonic clock like CLOCK_MONOTONIC, not wall-clock time.
- * Any origin works, only differences matter.
+ * Not wall-clock time. Any origin works, only differences matter.
  */
 typedef uint64_t natpmp_time_ms_t;
 
@@ -54,9 +53,6 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config);
  */
 void natpmp_session_end(natpmp_session_t *session);
 
-/**
- * @brief Identifies a request in the events that answer it
- */
 typedef uint16_t natpmp_handle_t;
 
 typedef struct natpmp_handle_or_error {
