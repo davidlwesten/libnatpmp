@@ -133,6 +133,9 @@ int main(int argc, char *argv[]) {
       running = false;
       break;
     }
+    case NATPMP_EVENT_MAPPED:
+      // never requested
+      break;
     case NATPMP_EVENT_FAILED:
       fprintf(stderr, "the gateway didn't give its external address\n");
       running = false;

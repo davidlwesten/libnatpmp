@@ -16,9 +16,13 @@ typedef struct natpmp_optional_time_ms {
   natpmp_time_ms_t value;
 } natpmp_optional_time_ms_t;
 
+typedef uint32_t natpmp_time_s_t;
+
 typedef struct natpmp_ipv4_address {
   uint8_t octets[4];
 } natpmp_ipv4_address_t;
+
+typedef uint16_t natpmp_port_t;
 
 typedef struct natpmp_allocator {
   void *(*alloc)(void *ctx, size_t size);
@@ -79,6 +83,36 @@ typedef struct natpmp_handle_or_error {
 natpmp_handle_or_error_t
 natpmp_session_address_request(natpmp_session_t *session);
 
+typedef enum natpmp_protocol {
+  NATPMP_PROTOCOL_TCP = 6,
+  NATPMP_PROTOCOL_UDP = 17,
+} natpmp_protocol_t;
+
+/**
+ * @brief Ask the gateway to map an external port to an internal one
+ *
+ * Answered by NATPMP_EVENT_MAPPED or NATPMP_EVENT_FAILED. Requests go to the
+ * gateway one at a time, in the order they were made. The session doesn't renew
+ * the mapping, so it ends after the lifetime MAPPED gives.
+ *
+ * The application should poll the session afterwards, see natpmp_session_poll.
+ *
+ * @param[in] session       The session that owns this request
+ * @param[in] lifetime      The lifetime to ask for (not 0)
+ * @param[in] protocol      NATPMP_PROTOCOL_UDP or NATPMP_PROTOCOL_TCP
+ * @param[in] port          The internal port to map (not 0)
+ * @param[in] external_port The external port to ask for, which the gateway may
+ *                          not grant. 0 means any port.
+ *
+ * @returns The handle, or an error (ENOBUFS if the queue is full)
+ */
+natpmp_handle_or_error_t
+natpmp_session_map_request(natpmp_session_t *session,
+                           natpmp_time_s_t lifetime,
+                           natpmp_protocol_t protocol,
+                           natpmp_port_t port,
+                           natpmp_port_t external_port);
+
 /**
  * @brief Something the application has to handle, see natpmp_session_poll
  *
@@ -92,6 +126,10 @@ typedef struct natpmp_event {
     /// The gateway's external address is `address.external_ip`. This is the
     /// last event for the handle.
     NATPMP_EVENT_ADDRESS,
+    /// The gateway maps `mapped.external_port` to the internal port for
+    /// `mapped.lifetime` seconds. Both can differ from what was asked for.
+    /// This is the last event for the handle.
+    NATPMP_EVENT_MAPPED,
     /// The gateway refused the request, didn't answer, or couldn't be reached.
     /// This is the last event for the handle.
     NATPMP_EVENT_FAILED,
@@ -110,6 +148,11 @@ typedef struct natpmp_event {
       natpmp_handle_t handle;
       natpmp_ipv4_address_t external_ip;
     } address;
+    struct {
+      natpmp_handle_t handle;
+      natpmp_port_t external_port;
+      natpmp_time_s_t lifetime;
+    } mapped;
     struct {
       natpmp_handle_t handle;
     } failed;
