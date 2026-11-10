@@ -31,8 +31,8 @@ typedef struct natpmp_allocator {
 
 typedef struct natpmp_config {
   natpmp_allocator_t allocator;
-  /// How many requests can wait to go out, 0 for 8
-  uint16_t queue_size;
+  /// How many requests and mappings the session can hold at once, 0 for 8
+  uint16_t capacity;
 } natpmp_config_t;
 
 typedef struct natpmp_session natpmp_session_t;
@@ -50,6 +50,9 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config);
 
 /**
  * @brief Free the session
+ *
+ * Doesn't delete the mappings, which stay on the gateway until their lifetime
+ * runs out.
  */
 void natpmp_session_end(natpmp_session_t *session);
 
@@ -74,7 +77,7 @@ typedef struct natpmp_handle_or_error {
  *
  * @param[in] session The session that owns this request
  *
- * @returns The handle, or an error (ENOBUFS if the queue is full)
+ * @returns The handle, or an error (ENOBUFS if the session is at capacity)
  */
 natpmp_handle_or_error_t
 natpmp_session_address_request(natpmp_session_t *session);
@@ -88,8 +91,9 @@ typedef enum natpmp_protocol {
  * @brief Ask the gateway to map an external port to an internal one
  *
  * Answered by NATPMP_EVENT_MAPPED or NATPMP_EVENT_FAILED. Requests go to the
- * gateway one at a time, in the order they were made. The session doesn't renew
- * the mapping, so it ends after the lifetime MAPPED gives.
+ * gateway one at a time, in the order they were made. The session renews the
+ * mapping halfway through every lifetime the gateway grants, with another
+ * NATPMP_EVENT_MAPPED each time, until it fails.
  *
  * The application should poll the session afterwards, see natpmp_session_poll.
  *
@@ -100,7 +104,7 @@ typedef enum natpmp_protocol {
  * @param[in] external_port The external port to ask for, which the gateway may
  *                          not grant. 0 means any port.
  *
- * @returns The handle, or an error (ENOBUFS if the queue is full)
+ * @returns The handle, or an error (ENOBUFS if the session is at capacity)
  */
 natpmp_handle_or_error_t
 natpmp_session_map_request(natpmp_session_t *session,
@@ -122,9 +126,9 @@ typedef struct natpmp_event {
     /// The gateway's external address is `address.external_ip`. This is the
     /// last event for the handle.
     NATPMP_EVENT_ADDRESS,
-    /// The gateway maps `mapped.external_port` to the internal port for
-    /// `mapped.lifetime` seconds. Both can differ from what was asked for.
-    /// This is the last event for the handle.
+    /// Each time the gateway grants the mapping: `mapped.external_port` to the
+    /// internal port for `mapped.lifetime` seconds. Both can differ from what
+    /// was asked for.
     NATPMP_EVENT_MAPPED,
     /// The gateway refused the request, didn't answer, or couldn't be reached.
     /// This is the last event for the handle.
@@ -183,10 +187,12 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
  * The application should poll the session afterwards, see natpmp_session_poll.
  *
  * @param[in] session The session to update
+ * @param[in] now     The current time
  * @param[in] size    The size of `data`
  * @param[in] data    The datagram's payload
  */
 void natpmp_session_on_datagram(natpmp_session_t *session,
+                                natpmp_time_ms_t now,
                                 size_t size,
                                 uint8_t const data[]);
 

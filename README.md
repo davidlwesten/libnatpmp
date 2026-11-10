@@ -8,8 +8,8 @@ NAT-PMP lets a host ask its router for the router's external IPv4 address and
 to forward ports to it. This library implements the client side: it builds
 requests, retransmits them and tells the application how the gateway answered.
 
-So far it asks for the external address and maps ports, but doesn't renew or
-delete mappings yet.
+So far it asks for the external address and maps ports, and renews the
+mappings, but doesn't delete them yet.
 
 [RFC 6886]: https://www.rfc-editor.org/rfc/rfc6886
 
@@ -53,7 +53,7 @@ while (running) {
       break;
     case NATPMP_EVENT_MAPPED:
       // event.mapped.handle got event.mapped.external_port for
-      // event.mapped.lifetime seconds
+      // event.mapped.lifetime seconds, again after every renewal
       break;
     case NATPMP_EVENT_FAILED:
     case NATPMP_EVENT_TIMEOUT:
@@ -62,7 +62,7 @@ while (running) {
   } while (event.type != NATPMP_EVENT_TIMEOUT);
 
   // wait for a datagram or until event.timeout.deadline, and hand any datagram
-  // to natpmp_session_on_datagram(session, size, data), or call
+  // to natpmp_session_on_datagram(session, now, size, data), or call
   // natpmp_session_on_unreachable(session) if the gateway's port is unreachable
 }
 

@@ -10,7 +10,7 @@
 #define ALLOC(allocator, ...) (allocator.alloc(allocator.ctx, __VA_ARGS__))
 #define FREE(allocator, ...) (allocator.free(allocator.ctx, __VA_ARGS__))
 
-static constexpr uint16_t NATPMP_DEFAULT_QUEUE_SIZE = 8;
+static constexpr uint16_t NATPMP_DEFAULT_CAPACITY = 8;
 
 typedef struct natpmp_request {
   /// The request behind this one in the queue
@@ -24,15 +24,19 @@ typedef struct natpmp_request {
     PENDING,
     ANSWERED,
     FAILED,
+    /// A mapping that was reported, until `map.renew_at`
+    ACTIVE,
   } state;
   union {
     /// Once ANSWERED
     natpmp_ipv4_address_t external_ip;
+    /// `external_port` and `lifetime` are asked for, then granted once
+    /// ANSWERED, and renewals ask for them again
     struct {
       natpmp_port_t internal_port;
-      /// Asked for, then granted once ANSWERED
       natpmp_port_t external_port;
       natpmp_time_s_t lifetime;
+      natpmp_time_ms_t renew_at;
     } map;
   };
 } natpmp_request_t;
@@ -43,11 +47,11 @@ struct natpmp_session {
   /// For the request at the head of the queue
   natpmp_retransmit_t retransmit;
   uint8_t outgoing_data[NATPMP_MAP_REQUEST_MAX_SIZE];
-  /// The pending requests, in the order they were made. Only the head is ever
-  /// on the wire.
+  /// The pending requests, in the order they were made or came up for renewal.
+  /// Only the head is ever on the wire.
   natpmp_request_t *queue;
-  /// `config.queue_size` slots, each request kept until its last event is
-  /// polled
+  /// `config.capacity` slots, each request kept until its last event is
+  /// polled, and each mapping until it fails
   natpmp_request_t requests[];
 };
 
@@ -64,17 +68,17 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config) {
   }
   assert(config.allocator.alloc && config.allocator.free);
 
-  if (config.queue_size == 0) {
-    config.queue_size = NATPMP_DEFAULT_QUEUE_SIZE;
+  if (config.capacity == 0) {
+    config.capacity = NATPMP_DEFAULT_CAPACITY;
   }
 
   natpmp_session_t *session =
       ALLOC(config.allocator, sizeof(natpmp_session_t) +
-                                  config.queue_size * sizeof(natpmp_request_t));
+                                  config.capacity * sizeof(natpmp_request_t));
   if (session) {
     *session = (natpmp_session_t){.config = config};
     auto const begin = session->requests;
-    auto const end = begin + config.queue_size;
+    auto const end = begin + config.capacity;
     for (auto request = begin; request != end; ++request) {
       *request = (natpmp_request_t){.state = FREE};
     }
@@ -102,7 +106,7 @@ static void natpmp_session_push(natpmp_session_t *session,
 static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
                                                    natpmp_request_t request) {
   auto const begin = session->requests;
-  auto const end = begin + session->config.queue_size;
+  auto const end = begin + session->config.capacity;
   for (auto slot = begin; slot != end; ++slot) {
     if (slot->state == FREE) {
       request.handle = ++session->handles;
@@ -166,7 +170,7 @@ static natpmp_request_t *natpmp_session_done(natpmp_session_t *session) {
   assert(session);
 
   auto const begin = session->requests;
-  auto const end = begin + session->config.queue_size;
+  auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
     if (request->state == ANSWERED || request->state == FAILED) {
       return request;
@@ -176,7 +180,7 @@ static natpmp_request_t *natpmp_session_done(natpmp_session_t *session) {
   return nullptr;
 }
 
-// the last event for a request that's done
+// the event for a request that's done
 static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   assert(request);
 
@@ -199,6 +203,34 @@ static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
                  .external_port = request->map.external_port,
                  .lifetime = request->map.lifetime},
   };
+}
+
+// lines up the mappings that are due for renewal, behind everything else
+//
+// returns when the next one is due
+static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
+                                                      natpmp_time_ms_t now) {
+  assert(session);
+
+  natpmp_optional_time_ms_t next = {};
+
+  auto const begin = session->requests;
+  auto const end = begin + session->config.capacity;
+  for (auto request = begin; request != end; ++request) {
+    if (request->state != ACTIVE) {
+      continue;
+    }
+
+    if (request->map.renew_at <= now) {
+      request->state = PENDING;
+      natpmp_session_push(session, request);
+    } else if (!next.has_value || request->map.renew_at < next.value) {
+      next = (natpmp_optional_time_ms_t){.has_value = true,
+                                         .value = request->map.renew_at};
+    }
+  }
+
+  return next;
 }
 
 // sends the head of the queue when it's due, and fails everything once it's
@@ -251,13 +283,16 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   auto const done = natpmp_session_done(session);
   if (done) {
     auto const event = natpmp_request_event(done);
-    done->state = FREE;
+    done->state = event.type == NATPMP_EVENT_MAPPED ? ACTIVE : FREE;
     return event;
   }
 
-  // with nothing to send, wait for the next request
+  // queue any renewals that are due, and if nothing is ready to send, return it
+  // as the session's timeout
+  auto const renewal = natpmp_session_renew(session, now);
   if (!session->queue) {
-    return (natpmp_event_t){.type = NATPMP_EVENT_TIMEOUT};
+    return (natpmp_event_t){.type = NATPMP_EVENT_TIMEOUT,
+                            .timeout = {.deadline = renewal}};
   }
 
   // send the head of the queue, or wait for its answer
@@ -265,6 +300,7 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
 }
 
 void natpmp_session_on_datagram(natpmp_session_t *session,
+                                natpmp_time_ms_t now,
                                 size_t size,
                                 uint8_t const data[]) {
   assert(session);
@@ -292,9 +328,16 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
     natpmp_session_request_done(session);
   } else if (r->type == NATPMP_RESPONSE_MAP && r->map.opcode == head->opcode &&
              r->map.internal_port == head->map.internal_port) {
-    head->state = ANSWERED;
-    head->map.external_port = r->map.external_port;
-    head->map.lifetime = r->map.lifetime;
+    if (r->map.lifetime > 0) {
+      head->state = ANSWERED;
+      head->map.external_port = r->map.external_port;
+      head->map.lifetime = r->map.lifetime;
+      // halfway through the lifetime
+      head->map.renew_at = now + (natpmp_time_ms_t)r->map.lifetime * 500;
+    } else {
+      // there's no mapping, and renewing it would delete it
+      head->state = FAILED;
+    }
     natpmp_session_request_done(session);
   } else if (r->type == NATPMP_RESPONSE_ERROR &&
              r->error.opcode == head->opcode) {

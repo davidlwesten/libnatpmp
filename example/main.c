@@ -105,7 +105,7 @@ receive(int fd, natpmp_session_t *session, natpmp_optional_time_ms_t deadline) {
     return;
   }
 
-  natpmp_session_on_datagram(session, (size_t)size, data);
+  natpmp_session_on_datagram(session, now(), (size_t)size, data);
 }
 
 int main(int argc, char *argv[]) {

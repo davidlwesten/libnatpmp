@@ -28,8 +28,8 @@ static natpmp_handle_t map(natpmp_protocol_t protocol) {
   return handle.value;
 }
 
-static void receive(size_t size, uint8_t const data[]) {
-  natpmp_session_on_datagram(session, size, data);
+static void receive(natpmp_time_ms_t now, size_t size, uint8_t const data[]) {
+  natpmp_session_on_datagram(session, now, size, data);
 }
 
 static uint8_t const address_request[] = {0, 0};
@@ -50,6 +50,16 @@ static uint8_t const map_tcp_request[] = {
     0x12, 0x34, 0x11, 0x11, // internal port, suggested external port
     0,    0,    0x0E, 0x10, // lifetime
 };
+
+// with the port and lifetime that map_response grants
+static uint8_t const map_tcp_renewal[] = {
+    0,    2,    0,    0,    // version, MAP_TCP, reserved
+    0x12, 0x34, 0x56, 0x78, // internal port, granted external port
+    0,    0,    0x1C, 0x20, // granted lifetime
+};
+
+// half the lifetime map_response grants
+static constexpr natpmp_time_ms_t renewal = 3600 * 1000;
 
 static uint8_t const map_response[] = {
     0,    130,  0,    0,    // version, R + MAP_TCP, SUCCESS
@@ -132,7 +142,7 @@ static void test_session_address() {
   auto const handle = request();
   expect_send(1000);
   expect_timeout(1000, 1250);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
 
   expect_address(1010, handle);
   expect_idle(1010);
@@ -148,13 +158,13 @@ static void test_session_one_at_a_time() {
   // the second waits for the first
   expect_send(0);
   expect_timeout(0, 250);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(10, first);
 
   // and gets its own request, from scratch
   expect_send(20);
   expect_timeout(20, 270);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(30, second);
   expect_idle(30);
   natpmp_session_end(session);
@@ -207,12 +217,12 @@ static void test_session_refused() {
   auto const first = request();
   auto const second = request();
   expect_send(0);
-  receive(sizeof(address_error), address_error);
+  receive(0, sizeof(address_error), address_error);
 
   // only the first, the second still gets its turn
   expect_failed(0, first);
   expect_send(0);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(0, second);
   natpmp_session_end(session);
 }
@@ -221,19 +231,19 @@ static void test_session_ignores_other_responses() {
   begin();
 
   // nothing asked for
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_idle(0);
 
   // or nothing sent yet
   request();
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_send(0);
 
   // not for the address request
-  receive(sizeof(map_response), map_response);
-  receive(sizeof(map_error), map_error);
+  receive(0, sizeof(map_response), map_response);
+  receive(0, sizeof(map_error), map_error);
   // and garbage
-  receive(3, address_response);
+  receive(0, 3, address_response);
   expect_timeout(0, 250);
   natpmp_session_end(session);
 }
@@ -243,20 +253,20 @@ static void test_session_ignores_late_responses() {
   auto const first = request();
   auto const second = request();
   expect_send(0);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
 
   // another answer to the first, before the second went out
-  receive(sizeof(address_error), address_error);
+  receive(0, sizeof(address_error), address_error);
   expect_address(0, first);
   expect_send(0);
   expect_timeout(0, 250);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(0, second);
   natpmp_session_end(session);
 }
 
-static void test_session_queue_full() {
-  session = natpmp_session_begin((natpmp_config_t){.queue_size = 2});
+static void test_session_full() {
+  session = natpmp_session_begin((natpmp_config_t){.capacity = 2});
   TEST_ASSERT_NOT_NULL(session);
   auto const first = request();
   request();
@@ -267,14 +277,14 @@ static void test_session_queue_full() {
 
   // room again once the first is reported
   expect_send(0);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   TEST_ASSERT_FALSE(natpmp_session_address_request(session).has_value);
   expect_address(0, first);
   request();
   natpmp_session_end(session);
 }
 
-static void test_session_default_queue_size() {
+static void test_session_default_capacity() {
   begin();
   for (int i = 0; i < 8; ++i) {
     request();
@@ -283,15 +293,15 @@ static void test_session_default_queue_size() {
   natpmp_session_end(session);
 }
 
-static void test_session_queue_wraps() {
-  session = natpmp_session_begin((natpmp_config_t){.queue_size = 2});
+static void test_session_reuses_slots() {
+  session = natpmp_session_begin((natpmp_config_t){.capacity = 2});
   TEST_ASSERT_NOT_NULL(session);
 
   // around the ring a few times
   for (int i = 0; i < 5; ++i) {
     auto const handle = request();
     expect_send(0);
-    receive(sizeof(address_response), address_response);
+    receive(0, sizeof(address_response), address_response);
     expect_address(0, handle);
   }
   expect_idle(0);
@@ -299,27 +309,27 @@ static void test_session_queue_wraps() {
 }
 
 static void test_session_keeps_order() {
-  session = natpmp_session_begin((natpmp_config_t){.queue_size = 3});
+  session = natpmp_session_begin((natpmp_config_t){.capacity = 3});
   TEST_ASSERT_NOT_NULL(session);
   auto const first = request();
   auto const second = map(NATPMP_PROTOCOL_TCP);
   auto const third = request();
   expect_send(0);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(0, first);
 
   // takes the first one's place, but still goes out last
   auto const fourth = map(NATPMP_PROTOCOL_TCP);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
-  receive(sizeof(map_response), map_response);
+  receive(0, sizeof(map_response), map_response);
   expect_mapped(0, second);
   expect_send(0);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(0, third);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
-  receive(sizeof(map_response), map_response);
+  receive(0, sizeof(map_response), map_response);
   expect_mapped(0, fourth);
-  expect_idle(0);
+  expect_timeout(0, renewal);
   natpmp_session_end(session);
 }
 
@@ -362,10 +372,11 @@ static void test_session_map() {
   auto const handle = map(NATPMP_PROTOCOL_TCP);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
   expect_timeout(0, 250);
-  receive(sizeof(map_response), map_response);
+  receive(5, sizeof(map_response), map_response);
 
+  // halfway from the answer
   expect_mapped(10, handle);
-  expect_idle(10);
+  expect_timeout(10, 5 + renewal);
   natpmp_session_end(session);
 }
 
@@ -388,7 +399,7 @@ static void test_session_map_udp() {
       0, 53,  0xC3, 0x50, // internal port, external port
       0, 0,   0,    30,   // lifetime
   };
-  receive(sizeof(map_udp_response), map_udp_response);
+  receive(0, sizeof(map_udp_response), map_udp_response);
 
   auto const event = natpmp_session_poll(session, 0);
   TEST_ASSERT_EQUAL(NATPMP_EVENT_MAPPED, event.type);
@@ -403,12 +414,12 @@ static void test_session_map_refused() {
   auto const first = map(NATPMP_PROTOCOL_TCP);
   auto const second = map(NATPMP_PROTOCOL_TCP);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
-  receive(sizeof(map_error), map_error);
+  receive(0, sizeof(map_error), map_error);
 
   // only the first, the second still gets its turn
   expect_failed(0, first);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
-  receive(sizeof(map_response), map_response);
+  receive(0, sizeof(map_response), map_response);
   expect_mapped(0, second);
   natpmp_session_end(session);
 }
@@ -419,24 +430,24 @@ static void test_session_map_ignores_other_responses() {
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
 
   // for the external address
-  receive(sizeof(address_response), address_response);
-  receive(sizeof(address_error), address_error);
+  receive(0, sizeof(address_response), address_response);
+  receive(0, sizeof(address_error), address_error);
 
   // for UDP
   uint8_t udp_response[sizeof(map_response)];
   memcpy(udp_response, map_response, sizeof(map_response));
   udp_response[1] = 129;
-  receive(sizeof(udp_response), udp_response);
+  receive(0, sizeof(udp_response), udp_response);
   uint8_t udp_error[sizeof(map_error)];
   memcpy(udp_error, map_error, sizeof(map_error));
   udp_error[1] = 129;
-  receive(sizeof(udp_error), udp_error);
+  receive(0, sizeof(udp_error), udp_error);
 
   // for another internal port
   uint8_t other_port[sizeof(map_response)];
   memcpy(other_port, map_response, sizeof(map_response));
   other_port[9] = 0x35;
-  receive(sizeof(other_port), other_port);
+  receive(0, sizeof(other_port), other_port);
 
   expect_timeout(0, 250);
   natpmp_session_end(session);
@@ -450,15 +461,15 @@ static void test_session_mixed() {
 
   // in the order they were made
   expect_send(0);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(0, first);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
-  receive(sizeof(map_response), map_response);
+  receive(0, sizeof(map_response), map_response);
   expect_mapped(0, second);
   expect_send(0);
-  receive(sizeof(address_response), address_response);
+  receive(0, sizeof(address_response), address_response);
   expect_address(0, third);
-  expect_idle(0);
+  expect_timeout(0, renewal);
   natpmp_session_end(session);
 }
 
@@ -475,6 +486,146 @@ static void test_session_map_unanswered_fails_queued() {
   expect_failed(now, first);
   expect_failed(now, second);
   expect_idle(now);
+  natpmp_session_end(session);
+}
+
+static void test_session_map_zero_lifetime() {
+  begin();
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+
+  uint8_t zero_lifetime[sizeof(map_response)];
+  memcpy(zero_lifetime, map_response, sizeof(map_response));
+  memset(&zero_lifetime[12], 0, 4);
+  receive(0, sizeof(zero_lifetime), zero_lifetime);
+  expect_failed(0, handle);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
+// a TCP mapping, granted at `now`
+static natpmp_handle_t mapped(natpmp_time_ms_t now) {
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(now, sizeof(map_tcp_request), map_tcp_request);
+  receive(now, sizeof(map_response), map_response);
+  expect_mapped(now, handle);
+  return handle;
+}
+
+static void test_session_renews() {
+  begin();
+  auto const handle = mapped(0);
+  expect_timeout(0, renewal);
+  expect_timeout(renewal - 1, renewal);
+
+  // asking for what the gateway granted
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  expect_timeout(renewal, renewal + 250);
+  receive(renewal + 5, sizeof(map_response), map_response);
+  expect_mapped(renewal + 10, handle);
+  expect_timeout(renewal + 10, renewal + 5 + renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_renewal_waits_its_turn() {
+  begin();
+  mapped(0);
+  auto const address = request();
+  expect_send(renewal - 1);
+
+  // due, but behind the address request
+  expect_timeout(renewal, renewal - 1 + 250);
+  receive(0, sizeof(address_response), address_response);
+  expect_address(renewal + 10, address);
+  expect_sent(renewal + 10, sizeof(map_tcp_renewal), map_tcp_renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_renewal_behind_reused_slot() {
+  begin();
+  auto const mapping = map(NATPMP_PROTOCOL_TCP);
+  auto const first = request();
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(0, sizeof(map_response), map_response);
+  expect_mapped(0, mapping);
+  expect_send(0);
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0, first);
+
+  // in the slot that was behind the mapping, and still waiting at the renewal
+  auto const second = request();
+  expect_send(renewal - 1);
+  expect_timeout(renewal, renewal - 1 + 250);
+  receive(renewal, sizeof(address_response), address_response);
+  expect_address(renewal, second);
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  receive(renewal, sizeof(map_response), map_response);
+  expect_mapped(renewal, mapping);
+  expect_timeout(renewal, renewal + renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_renewal_refused() {
+  session = natpmp_session_begin((natpmp_config_t){.capacity = 1});
+  TEST_ASSERT_NOT_NULL(session);
+  auto const handle = mapped(0);
+
+  // the mapping keeps its slot
+  TEST_ASSERT_FALSE(natpmp_session_address_request(session).has_value);
+
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  receive(0, sizeof(map_error), map_error);
+  expect_failed(renewal, handle);
+  expect_idle(renewal);
+
+  // until it fails
+  request();
+  natpmp_session_end(session);
+}
+
+static void test_session_renewal_unanswered() {
+  begin();
+  auto const first = mapped(0);
+  mapped(300 * 1000);
+  expect_timeout(300 * 1000, renewal);
+
+  natpmp_time_ms_t now = renewal;
+  for (int i = 0; i < 9; ++i) {
+    expect_sent(now, sizeof(map_tcp_renewal), map_tcp_renewal);
+    now += 250 << i;
+  }
+  expect_failed(now, first);
+
+  // the other one isn't due yet, so it's left alone
+  expect_timeout(now, 300 * 1000 + renewal);
+  expect_sent(300 * 1000 + renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_unreachable_after_answer() {
+  begin();
+  auto const first = map(NATPMP_PROTOCOL_TCP);
+  auto const second = request();
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(0, sizeof(map_response), map_response);
+
+  // the answer stands, only what's still waiting fails
+  natpmp_session_on_unreachable(session);
+  expect_mapped(0, first);
+  expect_failed(0, second);
+  expect_timeout(0, renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_reports_before_renewing() {
+  begin();
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(0, sizeof(map_response), map_response);
+
+  // polled only once the renewal is due
+  expect_mapped(renewal, handle);
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
   natpmp_session_end(session);
 }
 
@@ -497,7 +648,7 @@ static void test_session_allocator() {
   });
   TEST_ASSERT_NOT_NULL(session);
 
-  // the queue comes with the session
+  // the slots come with the session
   request();
   TEST_ASSERT_EQUAL_INT(1, live);
   natpmp_session_end(session);
@@ -522,9 +673,9 @@ void session_tests() {
   RUN_TEST(test_session_refused);
   RUN_TEST(test_session_ignores_other_responses);
   RUN_TEST(test_session_ignores_late_responses);
-  RUN_TEST(test_session_queue_full);
-  RUN_TEST(test_session_default_queue_size);
-  RUN_TEST(test_session_queue_wraps);
+  RUN_TEST(test_session_full);
+  RUN_TEST(test_session_default_capacity);
+  RUN_TEST(test_session_reuses_slots);
   RUN_TEST(test_session_keeps_order);
   RUN_TEST(test_session_unreachable);
   RUN_TEST(test_session_unreachable_before_sending);
@@ -534,6 +685,14 @@ void session_tests() {
   RUN_TEST(test_session_map_ignores_other_responses);
   RUN_TEST(test_session_mixed);
   RUN_TEST(test_session_map_unanswered_fails_queued);
+  RUN_TEST(test_session_map_zero_lifetime);
+  RUN_TEST(test_session_renews);
+  RUN_TEST(test_session_renewal_waits_its_turn);
+  RUN_TEST(test_session_renewal_behind_reused_slot);
+  RUN_TEST(test_session_renewal_refused);
+  RUN_TEST(test_session_renewal_unanswered);
+  RUN_TEST(test_session_unreachable_after_answer);
+  RUN_TEST(test_session_reports_before_renewing);
   RUN_TEST(test_session_allocator);
   RUN_TEST(test_session_out_of_memory);
 }
