@@ -12,6 +12,26 @@
 
 static constexpr uint16_t NATPMP_DEFAULT_CAPACITY = 8;
 
+/**
+ * @brief A request, kept in its slot from when it's made until its last event
+ *
+ * A slot moves through these states:
+ *
+ *   FREE        -> QUEUED    a request is made in it
+ *   QUEUED      -> SENT      it's at the head of the queue and goes out
+ *   SENT        -> ANSWERED  the gateway answers it
+ *   SENT        -> FAILED    the gateway refuses it, or maps it for no time
+ *   QUEUED/SENT -> FAILED    the head is given up on or the gateway can't be
+ *                            reached, which fails everything queued
+ *   ANSWERED    -> FREE      an external address request's answer is polled
+ *   ANSWERED    -> ACTIVE    a mapping's answer is polled
+ *   FAILED      -> FREE      its failure is polled
+ *   ACTIVE      -> QUEUED    `map.renew_at` passes, and it joins the back of
+ *                            the queue
+ *
+ * A request is in the queue exactly while it's QUEUED or SENT, and only the
+ * head is ever SENT. It stays SENT while it's retransmitted.
+ */
 typedef struct natpmp_request {
   /// The request behind this one in the queue
   struct natpmp_request *next;
@@ -20,8 +40,10 @@ typedef struct natpmp_request {
   enum natpmp_opcode opcode;
   enum {
     FREE,
-    /// Waiting to go out, or for the gateway's answer
-    PENDING,
+    /// Waiting to go out
+    QUEUED,
+    /// On the wire, waiting for the gateway's answer
+    SENT,
     ANSWERED,
     FAILED,
     /// A mapping that was reported, until `map.renew_at`
@@ -47,8 +69,8 @@ struct natpmp_session {
   /// For the request at the head of the queue
   natpmp_retransmit_t retransmit;
   uint8_t outgoing_data[NATPMP_MAP_REQUEST_MAX_SIZE];
-  /// The pending requests, in the order they were made or came up for renewal.
-  /// Only the head is ever on the wire.
+  /// The QUEUED and SENT requests, in the order they were made or came up for
+  /// renewal. Only the head is ever SENT.
   natpmp_request_t *queue;
   /// `config.capacity` slots, each request kept until its last event is
   /// polled, and each mapping until it fails
@@ -103,6 +125,10 @@ static void natpmp_session_push(natpmp_session_t *session,
   *last = request;
 }
 
+static void natpmp_session_pop(natpmp_session_t *session) {
+  session->queue = session->queue->next;
+}
+
 static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
                                                    natpmp_request_t request) {
   auto const begin = session->requests;
@@ -110,7 +136,7 @@ static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
   for (auto slot = begin; slot != end; ++slot) {
     if (slot->state == FREE) {
       request.handle = ++session->handles;
-      request.state = PENDING;
+      request.state = QUEUED;
       *slot = request;
       natpmp_session_push(session, slot);
       return (natpmp_handle_or_error_t){.has_value = true,
@@ -151,17 +177,11 @@ natpmp_session_map_request(natpmp_session_t *session,
                             });
 }
 
-// the request at the head is done, the next one starts from scratch
-static void natpmp_session_request_done(natpmp_session_t *session) {
-  session->queue = session->queue->next;
-  session->retransmit = (natpmp_retransmit_t){};
-}
-
 // the gateway is gone, so everything still waiting fails with the head
 static void natpmp_session_fail_all(natpmp_session_t *session) {
   while (session->queue) {
     session->queue->state = FAILED;
-    natpmp_session_request_done(session);
+    natpmp_session_pop(session);
   }
 }
 
@@ -222,7 +242,7 @@ static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
     }
 
     if (request->map.renew_at <= now) {
-      request->state = PENDING;
+      request->state = QUEUED;
       natpmp_session_push(session, request);
     } else if (!next.has_value || request->map.renew_at < next.value) {
       next = (natpmp_optional_time_ms_t){.has_value = true,
@@ -242,6 +262,11 @@ static natpmp_event_t natpmp_session_send(natpmp_session_t *session,
   auto const head = session->queue;
   assert(head);
 
+  if (head->state == QUEUED) {
+    // a new head, whose retransmissions start from scratch
+    session->retransmit = (natpmp_retransmit_t){};
+  }
+
   switch (natpmp_retransmit_poll(&session->retransmit, now)) {
   case NATPMP_RETRANSMIT_WAIT:
     break;
@@ -253,6 +278,7 @@ static natpmp_event_t natpmp_session_send(natpmp_session_t *session,
                           : natpmp_packet_write_map_request(
                                 dst, head->opcode, head->map.internal_port,
                                 head->map.external_port, head->map.lifetime);
+    head->state = SENT;
     natpmp_retransmit_advance(&session->retransmit, now);
     return (natpmp_event_t){
         .type = NATPMP_EVENT_SEND,
@@ -306,13 +332,10 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
   assert(session);
   assert(data || size == 0);
 
-  // nothing to wait for without a request on the wire, which is always the
-  // head then
-  if (session->retransmit.count == 0) {
+  auto const head = session->queue;
+  if (!head || head->state != SENT) {
     return;
   }
-  auto const head = session->queue;
-  assert(head && head->state == PENDING);
 
   auto const response =
       natpmp_packet_read_response((const_view_t){.size = size, .data = data});
@@ -325,7 +348,6 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
       head->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
     head->state = ANSWERED;
     head->external_ip = r->address.external_ip;
-    natpmp_session_request_done(session);
   } else if (r->type == NATPMP_RESPONSE_MAP && r->map.opcode == head->opcode &&
              r->map.internal_port == head->map.internal_port) {
     if (r->map.lifetime > 0) {
@@ -338,13 +360,15 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
       // there's no mapping, and renewing it would delete it
       head->state = FAILED;
     }
-    natpmp_session_request_done(session);
   } else if (r->type == NATPMP_RESPONSE_ERROR &&
              r->error.opcode == head->opcode) {
     // refused, which only concerns this request
     head->state = FAILED;
-    natpmp_session_request_done(session);
+  } else {
+    // not an answer to this request
+    return;
   }
+  natpmp_session_pop(session);
 }
 
 void natpmp_session_on_unreachable(natpmp_session_t *session) {
