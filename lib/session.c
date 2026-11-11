@@ -335,6 +335,55 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   unreachable();
 }
 
+static bool natpmp_request_matches(natpmp_request_t const *request,
+                                   natpmp_response_t const *response) {
+  assert(request);
+  assert(response);
+
+  switch (response->type) {
+  case NATPMP_RESPONSE_ERROR:
+    return response->error.opcode == request->opcode;
+  case NATPMP_RESPONSE_ADDRESS:
+    return request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS;
+  case NATPMP_RESPONSE_MAP:
+    return response->map.opcode == request->opcode &&
+           response->map.internal_port == request->map.internal_port;
+  }
+  unreachable();
+}
+
+// the response must match the request
+static void natpmp_request_answer(natpmp_request_t *request,
+                                  natpmp_response_t const *response,
+                                  natpmp_time_ms_t now) {
+  assert(request);
+  assert(response);
+
+  switch (response->type) {
+  case NATPMP_RESPONSE_ERROR:
+    // refused, which only concerns this request
+    request->state = FAILED;
+    return;
+  case NATPMP_RESPONSE_ADDRESS:
+    request->state = ANSWERED;
+    request->external_ip = response->address.external_ip;
+    return;
+  case NATPMP_RESPONSE_MAP:
+    if (response->map.lifetime == 0) {
+      // there's no mapping, and renewing it would delete it
+      request->state = FAILED;
+      return;
+    }
+    request->state = ANSWERED;
+    request->map.external_port = response->map.external_port;
+    request->map.lifetime = response->map.lifetime;
+    // halfway through the lifetime
+    request->map.renew_at =
+        now + (natpmp_time_ms_t)response->map.lifetime * 500;
+    return;
+  }
+}
+
 void natpmp_session_on_datagram(natpmp_session_t *session,
                                 natpmp_time_ms_t now,
                                 size_t size,
@@ -349,35 +398,12 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
 
   auto const response =
       natpmp_packet_read_response((const_view_t){.size = size, .data = data});
-  if (!response.has_value) {
+  if (!response.has_value || !natpmp_request_matches(head, &response.value)) {
+    // not an answer to the request on the wire
     return;
   }
 
-  auto const r = &response.value;
-  if (r->type == NATPMP_RESPONSE_ADDRESS &&
-      head->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
-    head->state = ANSWERED;
-    head->external_ip = r->address.external_ip;
-  } else if (r->type == NATPMP_RESPONSE_MAP && r->map.opcode == head->opcode &&
-             r->map.internal_port == head->map.internal_port) {
-    if (r->map.lifetime > 0) {
-      head->state = ANSWERED;
-      head->map.external_port = r->map.external_port;
-      head->map.lifetime = r->map.lifetime;
-      // halfway through the lifetime
-      head->map.renew_at = now + (natpmp_time_ms_t)r->map.lifetime * 500;
-    } else {
-      // there's no mapping, and renewing it would delete it
-      head->state = FAILED;
-    }
-  } else if (r->type == NATPMP_RESPONSE_ERROR &&
-             r->error.opcode == head->opcode) {
-    // refused, which only concerns this request
-    head->state = FAILED;
-  } else {
-    // not an answer to this request
-    return;
-  }
+  natpmp_request_answer(head, &response.value, now);
   natpmp_outgoing_pop(&session->outgoing);
 }
 
