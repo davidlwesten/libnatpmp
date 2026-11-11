@@ -139,6 +139,14 @@ static void natpmp_outgoing_pop(natpmp_outgoing_t *outgoing) {
   outgoing->queue = outgoing->queue->next;
 }
 
+// the gateway is gone, so everything still waiting fails with the head
+static void natpmp_outgoing_fail_all(natpmp_outgoing_t *outgoing) {
+  while (outgoing->queue) {
+    outgoing->queue->state = FAILED;
+    natpmp_outgoing_pop(outgoing);
+  }
+}
+
 // writes the head of the queue into `data` when it's due
 static natpmp_outgoing_status_t
 natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
@@ -215,14 +223,6 @@ natpmp_session_map_request(natpmp_session_t *session,
                                         .external_port = external_port,
                                         .lifetime = lifetime},
                             });
-}
-
-// the gateway is gone, so everything still waiting fails with the head
-static void natpmp_session_fail_all(natpmp_session_t *session) {
-  while (session->outgoing.queue) {
-    session->outgoing.queue->state = FAILED;
-    natpmp_outgoing_pop(&session->outgoing);
-  }
 }
 
 // a request whose last event is still to be polled, if any
@@ -328,7 +328,7 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
         .send = {.size = out.size, .data = session->outgoing.data},
     };
   case NATPMP_RETRANSMIT_GAVE_UP:
-    natpmp_session_fail_all(session);
+    natpmp_outgoing_fail_all(&session->outgoing);
     // there are FAILED events to report now
     return natpmp_session_poll(session, now);
   }
@@ -384,14 +384,15 @@ static void natpmp_request_answer(natpmp_request_t *request,
   }
 }
 
-void natpmp_session_on_datagram(natpmp_session_t *session,
-                                natpmp_time_ms_t now,
-                                size_t size,
-                                uint8_t const data[]) {
-  assert(session);
+// answers the request on the wire, if the datagram is for it
+static void natpmp_outgoing_on_datagram(natpmp_outgoing_t *outgoing,
+                                        natpmp_time_ms_t now,
+                                        size_t size,
+                                        uint8_t const data[]) {
+  assert(outgoing);
   assert(data || size == 0);
 
-  auto const head = session->outgoing.queue;
+  auto const head = outgoing->queue;
   if (!head || head->state != SENT) {
     return;
   }
@@ -404,10 +405,18 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
   }
 
   natpmp_request_answer(head, &response.value, now);
-  natpmp_outgoing_pop(&session->outgoing);
+  natpmp_outgoing_pop(outgoing);
+}
+
+void natpmp_session_on_datagram(natpmp_session_t *session,
+                                natpmp_time_ms_t now,
+                                size_t size,
+                                uint8_t const data[]) {
+  assert(session);
+  natpmp_outgoing_on_datagram(&session->outgoing, now, size, data);
 }
 
 void natpmp_session_on_unreachable(natpmp_session_t *session) {
   assert(session);
-  natpmp_session_fail_all(session);
+  natpmp_outgoing_fail_all(&session->outgoing);
 }
