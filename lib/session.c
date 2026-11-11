@@ -13,10 +13,13 @@
 static constexpr uint16_t NATPMP_DEFAULT_QUEUE_SIZE = 8;
 
 typedef struct natpmp_request {
+  /// The request behind this one in the queue
+  struct natpmp_request *next;
   natpmp_handle_t handle;
   /// Which request this is, and so which member of the union is in use
   enum natpmp_opcode opcode;
   enum {
+    FREE,
     /// Waiting to go out, or for the gateway's answer
     PENDING,
     ANSWERED,
@@ -40,12 +43,12 @@ struct natpmp_session {
   /// For the request at the head of the queue
   natpmp_retransmit_t retransmit;
   uint8_t outgoing_data[NATPMP_MAP_REQUEST_MAX_SIZE];
-  size_t queue_head;
-  size_t queue_count;
-  /// A ring buffer of `config.queue_size` requests, each kept until its last
-  /// event is polled. The done ones always come first, and only the first
-  /// pending one is ever on the wire.
-  natpmp_request_t queue[];
+  /// The pending requests, in the order they were made. Only the head is ever
+  /// on the wire.
+  natpmp_request_t *queue;
+  /// `config.queue_size` slots, each request kept until its last event is
+  /// polled
+  natpmp_request_t requests[];
 };
 
 static void *natpmp_default_alloc(void * /*ctx*/, size_t size) {
@@ -70,6 +73,11 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config) {
                                   config.queue_size * sizeof(natpmp_request_t));
   if (session) {
     *session = (natpmp_session_t){.config = config};
+    auto const begin = session->requests;
+    auto const end = begin + config.queue_size;
+    for (auto request = begin; request != end; ++request) {
+      *request = (natpmp_request_t){.state = FREE};
+    }
   }
 
   return session;
@@ -80,30 +88,39 @@ void natpmp_session_end(natpmp_session_t *session) {
   FREE(session->config.allocator, session);
 }
 
-static natpmp_request_t *natpmp_session_at(natpmp_session_t *session,
-                                           size_t index) {
-  return &session->queue[(session->queue_head + index) %
-                         session->config.queue_size];
+// puts the request at the back of the queue
+static void natpmp_session_push(natpmp_session_t *session,
+                                natpmp_request_t *request) {
+  natpmp_request_t **last = &session->queue;
+  while (*last) {
+    last = &(*last)->next;
+  }
+  request->next = nullptr;
+  *last = request;
 }
 
-static natpmp_handle_or_error_t
-natpmp_session_enqueue(natpmp_session_t *session, natpmp_request_t request) {
-  if (session->queue_count == session->config.queue_size) {
-    return (natpmp_handle_or_error_t){.has_value = false, .error = ENOBUFS};
+static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
+                                                   natpmp_request_t request) {
+  auto const begin = session->requests;
+  auto const end = begin + session->config.queue_size;
+  for (auto slot = begin; slot != end; ++slot) {
+    if (slot->state == FREE) {
+      request.handle = ++session->handles;
+      request.state = PENDING;
+      *slot = request;
+      natpmp_session_push(session, slot);
+      return (natpmp_handle_or_error_t){.has_value = true,
+                                        .value = request.handle};
+    }
   }
 
-  request.handle = ++session->handles;
-  request.state = PENDING;
-  *natpmp_session_at(session, session->queue_count) = request;
-  session->queue_count += 1;
-
-  return (natpmp_handle_or_error_t){.has_value = true, .value = request.handle};
+  return (natpmp_handle_or_error_t){.has_value = false, .error = ENOBUFS};
 }
 
 natpmp_handle_or_error_t
 natpmp_session_address_request(natpmp_session_t *session) {
   assert(session);
-  return natpmp_session_enqueue(
+  return natpmp_session_add(
       session, (natpmp_request_t){.opcode = NATPMP_OPCODE_EXTERNAL_ADDRESS});
 }
 
@@ -119,35 +136,50 @@ natpmp_session_map_request(natpmp_session_t *session,
   assert(port > 0);
   assert(protocol == NATPMP_PROTOCOL_UDP || protocol == NATPMP_PROTOCOL_TCP);
 
-  return natpmp_session_enqueue(session,
-                                (natpmp_request_t){
-                                    .opcode = protocol == NATPMP_PROTOCOL_UDP
-                                                  ? NATPMP_OPCODE_MAP_UDP
-                                                  : NATPMP_OPCODE_MAP_TCP,
-                                    .map = {.internal_port = port,
-                                            .external_port = external_port,
-                                            .lifetime = lifetime},
-                                });
+  return natpmp_session_add(session,
+                            (natpmp_request_t){
+                                .opcode = protocol == NATPMP_PROTOCOL_UDP
+                                              ? NATPMP_OPCODE_MAP_UDP
+                                              : NATPMP_OPCODE_MAP_TCP,
+                                .map = {.internal_port = port,
+                                        .external_port = external_port,
+                                        .lifetime = lifetime},
+                            });
 }
 
-// the request on the wire is done, the next one starts from scratch
+// the request at the head is done, the next one starts from scratch
 static void natpmp_session_request_done(natpmp_session_t *session) {
+  session->queue = session->queue->next;
   session->retransmit = (natpmp_retransmit_t){};
 }
 
 // the gateway is gone, so everything still waiting fails with the head
 static void natpmp_session_fail_all(natpmp_session_t *session) {
-  for (size_t i = 0; i < session->queue_count; ++i) {
-    auto const request = natpmp_session_at(session, i);
-    if (request->state == PENDING) {
-      request->state = FAILED;
+  while (session->queue) {
+    session->queue->state = FAILED;
+    natpmp_session_request_done(session);
+  }
+}
+
+// a request whose last event is still to be polled, if any
+static natpmp_request_t *natpmp_session_done(natpmp_session_t *session) {
+  assert(session);
+
+  auto const begin = session->requests;
+  auto const end = begin + session->config.queue_size;
+  for (auto request = begin; request != end; ++request) {
+    if (request->state == ANSWERED || request->state == FAILED) {
+      return request;
     }
   }
-  natpmp_session_request_done(session);
+
+  return nullptr;
 }
 
 // the last event for a request that's done
 static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
+  assert(request);
+
   if (request->state == FAILED) {
     return (natpmp_event_t){.type = NATPMP_EVENT_FAILED,
                             .failed = {.handle = request->handle}};
@@ -169,23 +201,14 @@ static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   };
 }
 
-natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
-                                   natpmp_time_ms_t now) {
+// sends the head of the queue when it's due, and fails everything once it's
+// given up on
+static natpmp_event_t natpmp_session_send(natpmp_session_t *session,
+                                          natpmp_time_ms_t now) {
   assert(session);
 
-  if (session->queue_count == 0) {
-    return (natpmp_event_t){.type = NATPMP_EVENT_TIMEOUT};
-  }
-
-  // report the requests that are done first
-  auto const head = natpmp_session_at(session, 0);
-  if (head->state != PENDING) {
-    auto const event = natpmp_request_event(head);
-    session->queue_head =
-        (session->queue_head + 1) % session->config.queue_size;
-    session->queue_count -= 1;
-    return event;
-  }
+  auto const head = session->queue;
+  assert(head);
 
   switch (natpmp_retransmit_poll(&session->retransmit, now)) {
   case NATPMP_RETRANSMIT_WAIT:
@@ -220,6 +243,27 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   };
 }
 
+natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
+                                   natpmp_time_ms_t now) {
+  assert(session);
+
+  // report what's answered or failed before sending anything
+  auto const done = natpmp_session_done(session);
+  if (done) {
+    auto const event = natpmp_request_event(done);
+    done->state = FREE;
+    return event;
+  }
+
+  // with nothing to send, wait for the next request
+  if (!session->queue) {
+    return (natpmp_event_t){.type = NATPMP_EVENT_TIMEOUT};
+  }
+
+  // send the head of the queue, or wait for its answer
+  return natpmp_session_send(session, now);
+}
+
 void natpmp_session_on_datagram(natpmp_session_t *session,
                                 size_t size,
                                 uint8_t const data[]) {
@@ -231,8 +275,8 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
   if (session->retransmit.count == 0) {
     return;
   }
-  auto const head = natpmp_session_at(session, 0);
-  assert(session->queue_count > 0 && head->state == PENDING);
+  auto const head = session->queue;
+  assert(head && head->state == PENDING);
 
   auto const response =
       natpmp_packet_read_response((const_view_t){.size = size, .data = data});

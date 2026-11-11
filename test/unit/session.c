@@ -298,6 +298,31 @@ static void test_session_queue_wraps() {
   natpmp_session_end(session);
 }
 
+static void test_session_keeps_order() {
+  session = natpmp_session_begin((natpmp_config_t){.queue_size = 3});
+  TEST_ASSERT_NOT_NULL(session);
+  auto const first = request();
+  auto const second = map(NATPMP_PROTOCOL_TCP);
+  auto const third = request();
+  expect_send(0);
+  receive(sizeof(address_response), address_response);
+  expect_address(0, first);
+
+  // takes the first one's place, but still goes out last
+  auto const fourth = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(sizeof(map_response), map_response);
+  expect_mapped(0, second);
+  expect_send(0);
+  receive(sizeof(address_response), address_response);
+  expect_address(0, third);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(sizeof(map_response), map_response);
+  expect_mapped(0, fourth);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
 static void test_session_unreachable() {
   begin();
   auto const first = request();
@@ -500,6 +525,7 @@ void session_tests() {
   RUN_TEST(test_session_queue_full);
   RUN_TEST(test_session_default_queue_size);
   RUN_TEST(test_session_queue_wraps);
+  RUN_TEST(test_session_keeps_order);
   RUN_TEST(test_session_unreachable);
   RUN_TEST(test_session_unreachable_before_sending);
   RUN_TEST(test_session_map);
