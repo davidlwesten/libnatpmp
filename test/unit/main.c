@@ -3,6 +3,7 @@
 void setUp() {}
 void tearDown() {}
 
+extern void epoch_tests();
 extern void packet_tests();
 extern void retransmit_tests();
 extern void session_tests();
@@ -14,6 +15,7 @@ int main(int argc, char *argv[]) {
 
   UNITY_BEGIN();
 
+  epoch_tests();
   packet_tests();
   retransmit_tests();
   session_tests();

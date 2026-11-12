@@ -7,6 +7,7 @@ function(natpmp_add_library target)
 
   target_sources(${target}
     PRIVATE
+      epoch.c
       packet.c
       retransmit.c
       session.c

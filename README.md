@@ -8,8 +8,9 @@ NAT-PMP lets a host ask its router for the router's external IPv4 address and
 to forward ports to it. This library implements the client side: it builds
 requests, retransmits them and tells the application how the gateway answered.
 
-It asks for the external address, maps ports, renews the mappings and deletes
-them once they're released.
+It asks for the external address, maps ports, renews the mappings (right
+away if the gateway reboots and loses them) and deletes them once they're
+released.
 
 [RFC 6886]: https://www.rfc-editor.org/rfc/rfc6886
 
@@ -32,7 +33,9 @@ returns `NATPMP_EVENT_TIMEOUT`, handles the events in between and waits for a
 datagram or the deadline:
 
 ```c
-natpmp_session_t *session = natpmp_session_begin((natpmp_config_t){});
+// fill_random writes random bytes, e.g. with getrandom or arc4random_buf
+natpmp_session_t *session =
+    natpmp_session_begin((natpmp_config_t){.rng = {.fill = fill_random}});
 
 auto const address = natpmp_session_address_request(session);
 // TCP port 8080, for an hour, preferably on the same external port

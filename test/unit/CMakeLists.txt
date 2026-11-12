@@ -1,5 +1,6 @@
 natpmp_add_test_executable(unit_tests
   main.c
+  epoch.c
   packet.c
   retransmit.c
   session.c)

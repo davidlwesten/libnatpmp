@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -24,6 +25,21 @@ static natpmp_time_ms_t now() {
   assert(result == 0);
   return (natpmp_time_ms_t)ts.tv_sec * 1000 +
          (natpmp_time_ms_t)ts.tv_nsec / 1000000;
+}
+
+static bool fill(void * /*ctx*/, size_t size, uint8_t data[]) {
+  size_t filled = 0;
+  while (filled < size) {
+    ssize_t const result = getrandom(data + filled, size - filled, 0);
+    if (result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    filled += (size_t)result;
+  }
+  return true;
 }
 
 // a number from `min` to `max`, or exits
@@ -137,7 +153,8 @@ int main(int argc, char *argv[]) {
 
   int const fd = connect_to_gateway(argv[1]);
 
-  natpmp_session_t *const session = natpmp_session_begin((natpmp_config_t){});
+  natpmp_session_t *const session =
+      natpmp_session_begin((natpmp_config_t){.rng = {.fill = fill}});
   if (!session) {
     fprintf(stderr, "out of memory\n");
     return EXIT_FAILURE;

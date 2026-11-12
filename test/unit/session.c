@@ -10,10 +10,30 @@
 
 static natpmp_session_t *session;
 
-static void begin() {
-  session = natpmp_session_begin((natpmp_config_t){});
-  TEST_ASSERT_NOT_NULL(session);
+// what the rng gives the session next
+static uint32_t random_value;
+static bool random_fails;
+
+static bool fill(void * /*ctx*/, size_t size, uint8_t data[]) {
+  if (random_fails) {
+    // and leaves garbage behind
+    memset(data, 0xFF, size);
+    return false;
+  }
+  TEST_ASSERT_EQUAL_size_t(sizeof(random_value), size);
+  memcpy(data, &random_value, size);
+  return true;
 }
+
+static natpmp_session_t *begin_with(natpmp_config_t config) {
+  random_value = 0;
+  random_fails = false;
+  config.rng.fill = fill;
+  session = natpmp_session_begin(config);
+  return session;
+}
+
+static void begin() { TEST_ASSERT_NOT_NULL(begin_with((natpmp_config_t){})); }
 
 static natpmp_handle_t request() {
   auto const handle = natpmp_session_address_request(session);
@@ -28,8 +48,26 @@ static natpmp_handle_t map(natpmp_protocol_t protocol) {
   return handle.value;
 }
 
+// with the epoch replaced, if `data` is long enough to carry one
+static void receive_epoch(natpmp_time_ms_t now,
+                          uint32_t epoch,
+                          size_t size,
+                          uint8_t const data[]) {
+  uint8_t copy[16] = {};
+  TEST_ASSERT_LESS_OR_EQUAL_size_t(sizeof(copy), size);
+  memcpy(copy, data, size);
+  if (size >= 8) {
+    copy[4] = (uint8_t)(epoch >> 24);
+    copy[5] = (uint8_t)(epoch >> 16);
+    copy[6] = (uint8_t)(epoch >> 8);
+    copy[7] = (uint8_t)epoch;
+  }
+  natpmp_session_on_datagram(session, now, size, copy);
+}
+
+// from a gateway that started 10 s before the session and kept running
 static void receive(natpmp_time_ms_t now, size_t size, uint8_t const data[]) {
-  natpmp_session_on_datagram(session, now, size, data);
+  receive_epoch(now, 10 + (uint32_t)(now / 1000), size, data);
 }
 
 static uint8_t const address_request[] = {0, 0};
@@ -279,7 +317,7 @@ static void test_session_ignores_late_responses() {
 }
 
 static void test_session_full() {
-  session = natpmp_session_begin((natpmp_config_t){.capacity = 2});
+  begin_with((natpmp_config_t){.capacity = 2});
   TEST_ASSERT_NOT_NULL(session);
   auto const first = request();
   request();
@@ -307,7 +345,7 @@ static void test_session_default_capacity() {
 }
 
 static void test_session_reuses_slots() {
-  session = natpmp_session_begin((natpmp_config_t){.capacity = 2});
+  begin_with((natpmp_config_t){.capacity = 2});
   TEST_ASSERT_NOT_NULL(session);
 
   // around the ring a few times
@@ -322,7 +360,7 @@ static void test_session_reuses_slots() {
 }
 
 static void test_session_keeps_order() {
-  session = natpmp_session_begin((natpmp_config_t){.capacity = 3});
+  begin_with((natpmp_config_t){.capacity = 3});
   TEST_ASSERT_NOT_NULL(session);
   auto const first = request();
   auto const second = map(NATPMP_PROTOCOL_TCP);
@@ -579,7 +617,7 @@ static void test_session_renewal_behind_reused_slot() {
 }
 
 static void test_session_renewal_refused() {
-  session = natpmp_session_begin((natpmp_config_t){.capacity = 1});
+  begin_with((natpmp_config_t){.capacity = 1});
   TEST_ASSERT_NOT_NULL(session);
   auto const handle = mapped(0);
 
@@ -657,7 +695,7 @@ static void test_session_release() {
 }
 
 static void test_session_release_frees_slot() {
-  session = natpmp_session_begin((natpmp_config_t){.capacity = 1});
+  begin_with((natpmp_config_t){.capacity = 1});
   TEST_ASSERT_NOT_NULL(session);
   auto const handle = mapped(0);
   natpmp_session_release(session, handle);
@@ -803,6 +841,76 @@ static void test_session_release_ignored() {
   natpmp_session_end(session);
 }
 
+static void test_session_epoch_reboot() {
+  begin();
+  auto const handle = mapped(0);
+
+  // a minute later, the gateway has only been up for a second, and the rng
+  // picks the longest delay
+  random_value = 5000;
+  receive_epoch(60'000, 1, sizeof(address_response), address_response);
+  expect_timeout(60'000, 65'000);
+  expect_sent(65'000, sizeof(map_tcp_renewal), map_tcp_renewal);
+  receive_epoch(65'000, 2, sizeof(map_response), map_response);
+  expect_mapped(65'000, handle);
+  expect_timeout(65'000, 65'000 + renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_epoch_answered() {
+  begin();
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(0, sizeof(map_response), map_response);
+
+  // granted, but not reported yet
+  random_value = 1000;
+  receive_epoch(60'000, 1, sizeof(address_response), address_response);
+  expect_mapped(60'000, handle);
+  expect_timeout(60'000, 61'000);
+  natpmp_session_end(session);
+}
+
+static void test_session_epoch_answers_after_reboot() {
+  begin();
+  auto const first = mapped(0);
+  auto const second =
+      natpmp_session_map_request(session, 3600, NATPMP_PROTOCOL_UDP, 0x1234, 0);
+  TEST_ASSERT_TRUE(second.has_value);
+  uint8_t const map_udp_request[] = {
+      0,    1,    0,    0,    // version, MAP_UDP, reserved
+      0x12, 0x34, 0,    0,    // internal port, any external port
+      0,    0,    0x0E, 0x10, // lifetime
+  };
+  expect_sent(60'000, sizeof(map_udp_request), map_udp_request);
+
+  // the answer that shows the reboot comes from the rebooted gateway
+  random_value = 1000;
+  uint8_t udp_response[sizeof(map_response)];
+  memcpy(udp_response, map_response, sizeof(map_response));
+  udp_response[1] = 129;
+  receive_epoch(60'000, 1, sizeof(udp_response), udp_response);
+  expect_mapped(60'000, second.value);
+  expect_timeout(60'000, 61'000);
+
+  expect_sent(61'000, sizeof(map_tcp_renewal), map_tcp_renewal);
+  receive_epoch(61'000, 2, sizeof(map_response), map_response);
+  expect_mapped(61'000, first);
+  expect_timeout(61'000, 60'000 + renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_epoch_without_random() {
+  begin();
+  mapped(0);
+
+  // renews right away
+  random_fails = true;
+  receive_epoch(60'000, 1, sizeof(address_response), address_response);
+  expect_sent(60'000, sizeof(map_tcp_renewal), map_tcp_renewal);
+  natpmp_session_end(session);
+}
+
 static void *counting_alloc(void *ctx, size_t size) {
   *(int *)ctx += 1;
   return malloc(size);
@@ -815,7 +923,7 @@ static void counting_free(void *ctx, void *ptr) {
 
 static void test_session_allocator() {
   int live = 0;
-  session = natpmp_session_begin((natpmp_config_t){
+  begin_with((natpmp_config_t){
       .allocator = {.alloc = counting_alloc,
                     .free = counting_free,
                     .ctx = &live},
@@ -832,7 +940,7 @@ static void test_session_allocator() {
 static void *failing_alloc(void * /*ctx*/, size_t /*size*/) { return nullptr; }
 
 static void test_session_out_of_memory() {
-  TEST_ASSERT_NULL(natpmp_session_begin((natpmp_config_t){
+  TEST_ASSERT_NULL(begin_with((natpmp_config_t){
       .allocator = {.alloc = failing_alloc, .free = counting_free},
   }));
 }
@@ -878,6 +986,10 @@ void session_tests() {
   RUN_TEST(test_session_release_unanswered);
   RUN_TEST(test_session_release_unreachable);
   RUN_TEST(test_session_release_ignored);
+  RUN_TEST(test_session_epoch_reboot);
+  RUN_TEST(test_session_epoch_answered);
+  RUN_TEST(test_session_epoch_answers_after_reboot);
+  RUN_TEST(test_session_epoch_without_random);
   RUN_TEST(test_session_allocator);
   RUN_TEST(test_session_out_of_memory);
 }

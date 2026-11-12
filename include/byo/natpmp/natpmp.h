@@ -29,8 +29,16 @@ typedef struct natpmp_allocator {
   void *ctx;
 } natpmp_allocator_t;
 
+typedef struct natpmp_rng {
+  /// Fills `data` with random bytes, or returns false if it can't. They don't
+  /// need to be cryptographically secure, only different for every client.
+  bool (*fill)(void *ctx, size_t size, uint8_t data[]);
+  void *ctx;
+} natpmp_rng_t;
+
 typedef struct natpmp_config {
   natpmp_allocator_t allocator;
+  natpmp_rng_t rng;
   /// How many handles the session can have in use at once, 0 for 8. A released
   /// mapping still takes up one until its deletion is done.
   uint16_t capacity;
@@ -41,7 +49,8 @@ typedef struct natpmp_session natpmp_session_t;
 /**
  * @brief Create a session
  *
- * If `config.allocator` is left zeroed, malloc and free are used.
+ * `config.rng` is required. If `config.allocator` is left zeroed, malloc and
+ * free are used.
  *
  * @param[in] config The session's configuration, copied into the session
  *
@@ -94,9 +103,9 @@ typedef enum natpmp_protocol {
  *
  * Answered by NATPMP_EVENT_MAPPED or NATPMP_EVENT_FAILED. Requests go to the
  * gateway one at a time, in the order they were made. The session renews the
- * mapping halfway through every lifetime the gateway grants, with another
- * NATPMP_EVENT_MAPPED each time, until it fails or is released (see
- * natpmp_session_release).
+ * mapping halfway through every lifetime the gateway grants, and within a few
+ * seconds if the gateway loses it, with another NATPMP_EVENT_MAPPED each time,
+ * until it fails or is released (see natpmp_session_release).
  *
  * The application should poll the session afterwards, see natpmp_session_poll.
  *

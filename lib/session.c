@@ -1,5 +1,6 @@
 #include <byo/natpmp/natpmp.h>
 
+#include "epoch.h"
 #include "packet.h"
 #include "retransmit.h"
 
@@ -249,6 +250,7 @@ static constexpr uint16_t NATPMP_DEFAULT_CAPACITY = 8;
 struct natpmp_session {
   natpmp_config_t config;
   natpmp_handle_t handles;
+  natpmp_epoch_t epoch;
   natpmp_outgoing_t outgoing;
   /// `config.capacity` slots, each request kept until its last event is
   /// polled, and each mapping until it fails or its deletion is done
@@ -267,6 +269,7 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config) {
     config.allocator.free = natpmp_default_free;
   }
   assert(config.allocator.alloc && config.allocator.free);
+  assert(config.rng.fill);
 
   if (config.capacity == 0) {
     config.capacity = NATPMP_DEFAULT_CAPACITY;
@@ -476,6 +479,29 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   unreachable();
 }
 
+// renews every mapping within 5 s, after the gateway lost them
+static void natpmp_session_recover(natpmp_session_t *session,
+                                   natpmp_time_ms_t now) {
+  assert(session);
+
+  // a random delay spreads out the clients that all saw the gateway reboot
+  uint32_t random = 0;
+  if (!session->config.rng.fill(session->config.rng.ctx, sizeof(random),
+                                (uint8_t *)&random)) {
+    random = 0;
+  }
+  auto const renew_at = now + random % 5001;
+
+  auto const begin = session->requests;
+  auto const end = begin + session->config.capacity;
+  for (auto request = begin; request != end; ++request) {
+    if (request->opcode != NATPMP_OPCODE_EXTERNAL_ADDRESS &&
+        (request->state == ANSWERED || request->state == ACTIVE)) {
+      request->map.renew_at = renew_at;
+    }
+  }
+}
+
 void natpmp_session_on_datagram(natpmp_session_t *session,
                                 natpmp_time_ms_t now,
                                 size_t size,
@@ -487,6 +513,12 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
       natpmp_packet_read_response((const_view_t){.size = size, .data = data});
   if (!response.has_value) {
     return;
+  }
+
+  // the response still answers the request on the wire, which went to the
+  // gateway as it is now, so only the mappings granted before it get renewed
+  if (natpmp_epoch_update(&session->epoch, now, response.value.epoch)) {
+    natpmp_session_recover(session, now);
   }
 
   natpmp_outgoing_on_response(&session->outgoing, now, &response.value);
