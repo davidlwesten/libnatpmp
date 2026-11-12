@@ -228,27 +228,19 @@ natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
                                     .size = size};
 }
 
-// answers the request on the wire, if the datagram is for it
-static void natpmp_outgoing_on_datagram(natpmp_outgoing_t *outgoing,
+// answers the request on the wire, if the response is for it
+static void natpmp_outgoing_on_response(natpmp_outgoing_t *outgoing,
                                         natpmp_time_ms_t now,
-                                        size_t size,
-                                        uint8_t const data[]) {
+                                        natpmp_response_t const *response) {
   assert(outgoing);
-  assert(data || size == 0);
+  assert(response);
 
-  if (!outgoing->request || outgoing->request->state != SENT) {
+  if (!outgoing->request || outgoing->request->state != SENT ||
+      !natpmp_request_matches(outgoing->request, response)) {
     return;
   }
 
-  auto const response =
-      natpmp_packet_read_response((const_view_t){.size = size, .data = data});
-  if (!response.has_value ||
-      !natpmp_request_matches(outgoing->request, &response.value)) {
-    // not an answer to the request on the wire
-    return;
-  }
-
-  natpmp_request_apply_answer(outgoing->request, &response.value, now);
+  natpmp_request_apply_answer(outgoing->request, response, now);
   natpmp_outgoing_pop(outgoing);
 }
 
@@ -489,7 +481,15 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
                                 size_t size,
                                 uint8_t const data[]) {
   assert(session);
-  natpmp_outgoing_on_datagram(&session->outgoing, now, size, data);
+  assert(data || size == 0);
+
+  auto const response =
+      natpmp_packet_read_response((const_view_t){.size = size, .data = data});
+  if (!response.has_value) {
+    return;
+  }
+
+  natpmp_outgoing_on_response(&session->outgoing, now, &response.value);
 }
 
 void natpmp_session_on_host_unreachable(natpmp_session_t *session) {
