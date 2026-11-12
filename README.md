@@ -8,8 +8,8 @@ NAT-PMP lets a host ask its router for the router's external IPv4 address and
 to forward ports to it. This library implements the client side: it builds
 requests, retransmits them and tells the application how the gateway answered.
 
-So far it asks for the external address and maps ports, and renews the
-mappings, but doesn't delete them yet.
+It asks for the external address, maps ports, renews the mappings and deletes
+them once they're released.
 
 [RFC 6886]: https://www.rfc-editor.org/rfc/rfc6886
 
@@ -67,6 +67,8 @@ while (running) {
   // unreachable
 }
 
+// to delete the mapping before ending, natpmp_session_release(session,
+// mapping.value) and keep polling until event.timeout.deadline is empty
 natpmp_session_end(session);
 ```
 

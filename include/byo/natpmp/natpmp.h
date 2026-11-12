@@ -31,7 +31,8 @@ typedef struct natpmp_allocator {
 
 typedef struct natpmp_config {
   natpmp_allocator_t allocator;
-  /// How many requests and mappings the session can hold at once, 0 for 8
+  /// How many handles the session can have in use at once, 0 for 8. A released
+  /// mapping still takes up one until its deletion is done.
   uint16_t capacity;
 } natpmp_config_t;
 
@@ -52,7 +53,8 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config);
  * @brief Free the session
  *
  * Doesn't delete the mappings, which stay on the gateway until their lifetime
- * runs out.
+ * runs out. For a clean shutdown, release all mappings and keep polling until
+ * NATPMP_EVENT_TIMEOUT has no deadline.
  */
 void natpmp_session_end(natpmp_session_t *session);
 
@@ -93,7 +95,8 @@ typedef enum natpmp_protocol {
  * Answered by NATPMP_EVENT_MAPPED or NATPMP_EVENT_FAILED. Requests go to the
  * gateway one at a time, in the order they were made. The session renews the
  * mapping halfway through every lifetime the gateway grants, with another
- * NATPMP_EVENT_MAPPED each time, until it fails.
+ * NATPMP_EVENT_MAPPED each time, until it fails or is released (see
+ * natpmp_session_release).
  *
  * The application should poll the session afterwards, see natpmp_session_poll.
  *
@@ -112,6 +115,18 @@ natpmp_session_map_request(natpmp_session_t *session,
                            natpmp_protocol_t protocol,
                            natpmp_port_t port,
                            natpmp_port_t external_port);
+
+/**
+ * @brief Release a mapping the application no longer needs
+ *
+ * The gateway gets asked to delete it, so poll afterwards. The handle is
+ * invalid after this and no more events will refer to it.
+ *
+ * @param[in] session The session that owns the mapping
+ * @param[in] handle  The mapping to release. Ignored if it was already
+ *                    released or failed, or isn't a mapping.
+ */
+void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle);
 
 /**
  * @brief Something the application has to handle, see natpmp_session_poll

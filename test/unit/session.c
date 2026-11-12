@@ -73,6 +73,19 @@ static uint8_t const map_error[] = {
     0, 0,   0, 10, 0x12, 0x34, 0, 0, 0, 0, 0, 0,
 };
 
+static uint8_t const map_tcp_deletion[] = {
+    0,    2,    0, 0, // version, MAP_TCP, reserved
+    0x12, 0x34, 0, 0, // internal port, no external port
+    0,    0,    0, 0, // no lifetime
+};
+
+static uint8_t const deletion_response[] = {
+    0,    130,  0, 0,  // version, R + MAP_TCP, SUCCESS
+    0,    0,    0, 10, // epoch
+    0x12, 0x34, 0, 0,  // internal port, no external port
+    0,    0,    0, 0,  // no lifetime
+};
+
 static void
 expect_sent(natpmp_time_ms_t now, size_t size, uint8_t const data[]) {
   auto const event = natpmp_session_poll(session, now);
@@ -629,6 +642,167 @@ static void test_session_reports_before_renewing() {
   natpmp_session_end(session);
 }
 
+static void test_session_release() {
+  begin();
+  auto const handle = mapped(0);
+  natpmp_session_release(session, handle);
+
+  expect_sent(10, sizeof(map_tcp_deletion), map_tcp_deletion);
+  expect_timeout(10, 260);
+  receive(20, sizeof(deletion_response), deletion_response);
+
+  // no event, and no more renewals
+  expect_idle(20);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_frees_slot() {
+  session = natpmp_session_begin((natpmp_config_t){.capacity = 1});
+  TEST_ASSERT_NOT_NULL(session);
+  auto const handle = mapped(0);
+  natpmp_session_release(session, handle);
+
+  // only once the deletion is done
+  TEST_ASSERT_FALSE(natpmp_session_address_request(session).has_value);
+  expect_sent(0, sizeof(map_tcp_deletion), map_tcp_deletion);
+  receive(0, sizeof(deletion_response), deletion_response);
+  request();
+  natpmp_session_end(session);
+}
+
+static void test_session_release_queued() {
+  begin();
+  auto const mapping = map(NATPMP_PROTOCOL_TCP);
+  auto const address = request();
+  natpmp_session_release(session, mapping);
+
+  // keeps its place, ahead of the address request
+  expect_sent(0, sizeof(map_tcp_deletion), map_tcp_deletion);
+  receive(0, sizeof(deletion_response), deletion_response);
+  expect_send(0);
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0, address);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_sent() {
+  begin();
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  natpmp_session_release(session, handle);
+
+  // right away, from scratch
+  expect_sent(10, sizeof(map_tcp_deletion), map_tcp_deletion);
+  expect_timeout(10, 260);
+
+  // and the grant for the map request comes too late
+  receive(20, sizeof(map_response), map_response);
+  expect_timeout(20, 260);
+  receive(30, sizeof(deletion_response), deletion_response);
+  expect_idle(30);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_answered() {
+  begin();
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(0, sizeof(map_response), map_response);
+
+  // before the grant is polled, which is then never reported
+  natpmp_session_release(session, handle);
+  expect_sent(0, sizeof(map_tcp_deletion), map_tcp_deletion);
+  receive(0, sizeof(deletion_response), deletion_response);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_waits_its_turn() {
+  begin();
+  auto const mapping = mapped(0);
+  auto const address = request();
+  natpmp_session_release(session, mapping);
+
+  // behind the address request
+  expect_send(0);
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0, address);
+  expect_sent(0, sizeof(map_tcp_deletion), map_tcp_deletion);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_failed() {
+  begin();
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+  receive(0, sizeof(map_error), map_error);
+
+  // nothing to delete, and the failure isn't reported
+  natpmp_session_release(session, handle);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_refused() {
+  begin();
+  auto const handle = mapped(0);
+  natpmp_session_release(session, handle);
+  expect_sent(0, sizeof(map_tcp_deletion), map_tcp_deletion);
+
+  // left to expire on the gateway
+  receive(0, sizeof(map_error), map_error);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_unanswered() {
+  begin();
+  auto const handle = mapped(0);
+  natpmp_session_release(session, handle);
+  natpmp_time_ms_t now = 0;
+  for (int i = 0; i < 9; ++i) {
+    expect_sent(now, sizeof(map_tcp_deletion), map_tcp_deletion);
+    now += 250 << i;
+  }
+
+  // left to expire on the gateway
+  expect_idle(now);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_unreachable() {
+  begin();
+  auto const handle = mapped(0);
+  natpmp_session_release(session, handle);
+  expect_sent(0, sizeof(map_tcp_deletion), map_tcp_deletion);
+
+  // left to expire on the gateway
+  natpmp_session_on_host_unreachable(session);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_ignored() {
+  begin();
+
+  // not a mapping, or no such handle
+  auto const address = request();
+  natpmp_session_release(session, address);
+  natpmp_session_release(session, 999);
+  expect_send(0);
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0, address);
+
+  // or already released, which doesn't start the deletion over
+  auto const mapping = mapped(0);
+  natpmp_session_release(session, mapping);
+  expect_sent(0, sizeof(map_tcp_deletion), map_tcp_deletion);
+  natpmp_session_release(session, mapping);
+  expect_timeout(10, 250);
+  natpmp_session_end(session);
+}
+
 static void *counting_alloc(void *ctx, size_t size) {
   *(int *)ctx += 1;
   return malloc(size);
@@ -693,6 +867,17 @@ void session_tests() {
   RUN_TEST(test_session_renewal_unanswered);
   RUN_TEST(test_session_unreachable_after_answer);
   RUN_TEST(test_session_reports_before_renewing);
+  RUN_TEST(test_session_release);
+  RUN_TEST(test_session_release_frees_slot);
+  RUN_TEST(test_session_release_queued);
+  RUN_TEST(test_session_release_sent);
+  RUN_TEST(test_session_release_answered);
+  RUN_TEST(test_session_release_waits_its_turn);
+  RUN_TEST(test_session_release_failed);
+  RUN_TEST(test_session_release_refused);
+  RUN_TEST(test_session_release_unanswered);
+  RUN_TEST(test_session_release_unreachable);
+  RUN_TEST(test_session_release_ignored);
   RUN_TEST(test_session_allocator);
   RUN_TEST(test_session_out_of_memory);
 }
