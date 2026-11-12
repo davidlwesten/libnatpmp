@@ -10,8 +10,6 @@
 #define ALLOC(allocator, ...) (allocator.alloc(allocator.ctx, __VA_ARGS__))
 #define FREE(allocator, ...) (allocator.free(allocator.ctx, __VA_ARGS__))
 
-static constexpr uint16_t NATPMP_DEFAULT_CAPACITY = 8;
-
 /**
  * @brief A request, kept in its slot from when it's made until its last event
  *
@@ -78,6 +76,87 @@ static bool natpmp_request_released(natpmp_request_t const *request) {
          request->map.lifetime == 0;
 }
 
+// the event for a request that's done
+static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
+  assert(request);
+
+  if (request->state == FAILED) {
+    return (natpmp_event_t){.type = NATPMP_EVENT_FAILED,
+                            .failed = {.handle = request->handle}};
+  }
+
+  if (request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
+    return (natpmp_event_t){
+        .type = NATPMP_EVENT_ADDRESS,
+        .address = {.handle = request->handle,
+                    .external_ip = request->external_ip},
+    };
+  }
+
+  return (natpmp_event_t){
+      .type = NATPMP_EVENT_MAPPED,
+      .mapped = {.handle = request->handle,
+                 .external_port = request->map.external_port,
+                 .lifetime = request->map.lifetime},
+  };
+}
+
+static bool natpmp_request_matches(natpmp_request_t const *request,
+                                   natpmp_response_t const *response) {
+  assert(request);
+  assert(response);
+
+  switch (response->type) {
+  case NATPMP_RESPONSE_ERROR:
+    return response->error.opcode == request->opcode;
+  case NATPMP_RESPONSE_ADDRESS:
+    return request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS;
+  case NATPMP_RESPONSE_MAP:
+    // a released mapping waits for its deletion, not a late grant
+    return response->map.opcode == request->opcode &&
+           response->map.internal_port == request->map.internal_port &&
+           (!natpmp_request_released(request) || response->map.lifetime == 0);
+  }
+  unreachable();
+}
+
+static void natpmp_request_apply_answer(natpmp_request_t *request,
+                                        natpmp_response_t const *response,
+                                        natpmp_time_ms_t now) {
+  assert(request);
+  assert(response);
+
+  if (natpmp_request_released(request)) {
+    // deleted, or refused and left to expire
+    request->state = FREE;
+    return;
+  }
+
+  switch (response->type) {
+  case NATPMP_RESPONSE_ERROR:
+    // refused, which only concerns this request
+    request->state = FAILED;
+    return;
+  case NATPMP_RESPONSE_ADDRESS:
+    request->state = ANSWERED;
+    request->external_ip = response->address.external_ip;
+    return;
+  case NATPMP_RESPONSE_MAP:
+    if (response->map.lifetime == 0) {
+      // there's no mapping, and renewing it would delete it
+      request->state = FAILED;
+      return;
+    }
+    request->state = ANSWERED;
+    request->map.external_port = response->map.external_port;
+    request->map.lifetime = response->map.lifetime;
+    // halfway through the lifetime
+    request->map.renew_at =
+        now + (natpmp_time_ms_t)response->map.lifetime * 500;
+    return;
+  }
+}
+
 typedef struct natpmp_outgoing {
   /// The request going out, with the QUEUED ones behind it through `next`, in
   /// the order they were made or came up for renewal. Only it is ever SENT.
@@ -92,52 +171,6 @@ typedef struct natpmp_outgoing_status {
   /// How much of `data` to send, when DUE
   size_t size;
 } natpmp_outgoing_status_t;
-
-struct natpmp_session {
-  natpmp_config_t config;
-  natpmp_handle_t handles;
-  natpmp_outgoing_t outgoing;
-  /// `config.capacity` slots, each request kept until its last event is
-  /// polled, and each mapping until it fails or its deletion is done
-  natpmp_request_t requests[];
-};
-
-static void *natpmp_default_alloc(void * /*ctx*/, size_t size) {
-  return malloc(size);
-}
-
-static void natpmp_default_free(void * /*ctx*/, void *ptr) { free(ptr); }
-
-natpmp_session_t *natpmp_session_begin(natpmp_config_t config) {
-  if (!config.allocator.alloc && !config.allocator.free) {
-    config.allocator.alloc = natpmp_default_alloc;
-    config.allocator.free = natpmp_default_free;
-  }
-  assert(config.allocator.alloc && config.allocator.free);
-
-  if (config.capacity == 0) {
-    config.capacity = NATPMP_DEFAULT_CAPACITY;
-  }
-
-  natpmp_session_t *session =
-      ALLOC(config.allocator, sizeof(natpmp_session_t) +
-                                  config.capacity * sizeof(natpmp_request_t));
-  if (session) {
-    *session = (natpmp_session_t){.config = config};
-    auto const begin = session->requests;
-    auto const end = begin + config.capacity;
-    for (auto request = begin; request != end; ++request) {
-      *request = (natpmp_request_t){.state = FREE};
-    }
-  }
-
-  return session;
-}
-
-void natpmp_session_end(natpmp_session_t *session) {
-  assert(session);
-  FREE(session->config.allocator, session);
-}
 
 // puts the request at the back of the queue
 static void natpmp_outgoing_push(natpmp_outgoing_t *outgoing,
@@ -193,6 +226,78 @@ natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
   natpmp_retransmit_advance(&outgoing->retransmit, now);
   return (natpmp_outgoing_status_t){.status = NATPMP_RETRANSMIT_DUE,
                                     .size = size};
+}
+
+// answers the request on the wire, if the datagram is for it
+static void natpmp_outgoing_on_datagram(natpmp_outgoing_t *outgoing,
+                                        natpmp_time_ms_t now,
+                                        size_t size,
+                                        uint8_t const data[]) {
+  assert(outgoing);
+  assert(data || size == 0);
+
+  if (!outgoing->request || outgoing->request->state != SENT) {
+    return;
+  }
+
+  auto const response =
+      natpmp_packet_read_response((const_view_t){.size = size, .data = data});
+  if (!response.has_value ||
+      !natpmp_request_matches(outgoing->request, &response.value)) {
+    // not an answer to the request on the wire
+    return;
+  }
+
+  natpmp_request_apply_answer(outgoing->request, &response.value, now);
+  natpmp_outgoing_pop(outgoing);
+}
+
+static constexpr uint16_t NATPMP_DEFAULT_CAPACITY = 8;
+
+struct natpmp_session {
+  natpmp_config_t config;
+  natpmp_handle_t handles;
+  natpmp_outgoing_t outgoing;
+  /// `config.capacity` slots, each request kept until its last event is
+  /// polled, and each mapping until it fails or its deletion is done
+  natpmp_request_t requests[];
+};
+
+static void *natpmp_default_alloc(void * /*ctx*/, size_t size) {
+  return malloc(size);
+}
+
+static void natpmp_default_free(void * /*ctx*/, void *ptr) { free(ptr); }
+
+natpmp_session_t *natpmp_session_begin(natpmp_config_t config) {
+  if (!config.allocator.alloc && !config.allocator.free) {
+    config.allocator.alloc = natpmp_default_alloc;
+    config.allocator.free = natpmp_default_free;
+  }
+  assert(config.allocator.alloc && config.allocator.free);
+
+  if (config.capacity == 0) {
+    config.capacity = NATPMP_DEFAULT_CAPACITY;
+  }
+
+  natpmp_session_t *session =
+      ALLOC(config.allocator, sizeof(natpmp_session_t) +
+                                  config.capacity * sizeof(natpmp_request_t));
+  if (session) {
+    *session = (natpmp_session_t){.config = config};
+    auto const begin = session->requests;
+    auto const end = begin + config.capacity;
+    for (auto request = begin; request != end; ++request) {
+      *request = (natpmp_request_t){.state = FREE};
+    }
+  }
+
+  return session;
+}
+
+void natpmp_session_end(natpmp_session_t *session) {
+  assert(session);
+  FREE(session->config.allocator, session);
 }
 
 static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
@@ -310,31 +415,6 @@ static natpmp_request_t *natpmp_session_done(natpmp_session_t *session) {
   return nullptr;
 }
 
-// the event for a request that's done
-static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
-  assert(request);
-
-  if (request->state == FAILED) {
-    return (natpmp_event_t){.type = NATPMP_EVENT_FAILED,
-                            .failed = {.handle = request->handle}};
-  }
-
-  if (request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
-    return (natpmp_event_t){
-        .type = NATPMP_EVENT_ADDRESS,
-        .address = {.handle = request->handle,
-                    .external_ip = request->external_ip},
-    };
-  }
-
-  return (natpmp_event_t){
-      .type = NATPMP_EVENT_MAPPED,
-      .mapped = {.handle = request->handle,
-                 .external_port = request->map.external_port,
-                 .lifetime = request->map.lifetime},
-  };
-}
-
 // queues the mappings that are due for renewal, and returns when the next one
 // is due
 static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
@@ -402,86 +482,6 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
     return natpmp_session_poll(session, now);
   }
   unreachable();
-}
-
-static bool natpmp_request_matches(natpmp_request_t const *request,
-                                   natpmp_response_t const *response) {
-  assert(request);
-  assert(response);
-
-  switch (response->type) {
-  case NATPMP_RESPONSE_ERROR:
-    return response->error.opcode == request->opcode;
-  case NATPMP_RESPONSE_ADDRESS:
-    return request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS;
-  case NATPMP_RESPONSE_MAP:
-    // a released mapping waits for its deletion, not a late grant
-    return response->map.opcode == request->opcode &&
-           response->map.internal_port == request->map.internal_port &&
-           (!natpmp_request_released(request) || response->map.lifetime == 0);
-  }
-  unreachable();
-}
-
-static void natpmp_request_apply_answer(natpmp_request_t *request,
-                                        natpmp_response_t const *response,
-                                        natpmp_time_ms_t now) {
-  assert(request);
-  assert(response);
-
-  if (natpmp_request_released(request)) {
-    // deleted, or refused and left to expire
-    request->state = FREE;
-    return;
-  }
-
-  switch (response->type) {
-  case NATPMP_RESPONSE_ERROR:
-    // refused, which only concerns this request
-    request->state = FAILED;
-    return;
-  case NATPMP_RESPONSE_ADDRESS:
-    request->state = ANSWERED;
-    request->external_ip = response->address.external_ip;
-    return;
-  case NATPMP_RESPONSE_MAP:
-    if (response->map.lifetime == 0) {
-      // there's no mapping, and renewing it would delete it
-      request->state = FAILED;
-      return;
-    }
-    request->state = ANSWERED;
-    request->map.external_port = response->map.external_port;
-    request->map.lifetime = response->map.lifetime;
-    // halfway through the lifetime
-    request->map.renew_at =
-        now + (natpmp_time_ms_t)response->map.lifetime * 500;
-    return;
-  }
-}
-
-// answers the request on the wire, if the datagram is for it
-static void natpmp_outgoing_on_datagram(natpmp_outgoing_t *outgoing,
-                                        natpmp_time_ms_t now,
-                                        size_t size,
-                                        uint8_t const data[]) {
-  assert(outgoing);
-  assert(data || size == 0);
-
-  if (!outgoing->request || outgoing->request->state != SENT) {
-    return;
-  }
-
-  auto const response =
-      natpmp_packet_read_response((const_view_t){.size = size, .data = data});
-  if (!response.has_value ||
-      !natpmp_request_matches(outgoing->request, &response.value)) {
-    // not an answer to the request on the wire
-    return;
-  }
-
-  natpmp_request_apply_answer(outgoing->request, &response.value, now);
-  natpmp_outgoing_pop(outgoing);
 }
 
 void natpmp_session_on_datagram(natpmp_session_t *session,
