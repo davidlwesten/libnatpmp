@@ -207,4 +207,4 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
  *
  * @param[in] session The session to update
  */
-void natpmp_session_on_unreachable(natpmp_session_t *session);
+void natpmp_session_on_host_unreachable(natpmp_session_t *session);

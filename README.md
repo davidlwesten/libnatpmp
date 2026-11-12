@@ -63,7 +63,8 @@ while (running) {
 
   // wait for a datagram or until event.timeout.deadline, and hand any datagram
   // to natpmp_session_on_datagram(session, now, size, data), or call
-  // natpmp_session_on_unreachable(session) if the gateway's port is unreachable
+  // natpmp_session_on_host_unreachable(session) if the gateway's port is
+  // unreachable
 }
 
 natpmp_session_end(session);

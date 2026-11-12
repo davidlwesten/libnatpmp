@@ -265,9 +265,8 @@ static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   };
 }
 
-// lines up the mappings that are due for renewal, behind everything else
-//
-// returns when the next one is due
+// queues the mappings that are due for renewal, and returns when the next one
+// is due
 static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
                                                       natpmp_time_ms_t now) {
   assert(session);
@@ -352,10 +351,9 @@ static bool natpmp_request_matches(natpmp_request_t const *request,
   unreachable();
 }
 
-// the response must match the request
-static void natpmp_request_answer(natpmp_request_t *request,
-                                  natpmp_response_t const *response,
-                                  natpmp_time_ms_t now) {
+static void natpmp_request_apply_answer(natpmp_request_t *request,
+                                        natpmp_response_t const *response,
+                                        natpmp_time_ms_t now) {
   assert(request);
   assert(response);
 
@@ -404,7 +402,7 @@ static void natpmp_outgoing_on_datagram(natpmp_outgoing_t *outgoing,
     return;
   }
 
-  natpmp_request_answer(head, &response.value, now);
+  natpmp_request_apply_answer(head, &response.value, now);
   natpmp_outgoing_pop(outgoing);
 }
 
@@ -416,7 +414,7 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
   natpmp_outgoing_on_datagram(&session->outgoing, now, size, data);
 }
 
-void natpmp_session_on_unreachable(natpmp_session_t *session) {
+void natpmp_session_on_host_unreachable(natpmp_session_t *session) {
   assert(session);
   natpmp_outgoing_fail_all(&session->outgoing);
 }

@@ -340,7 +340,7 @@ static void test_session_unreachable() {
   expect_send(0);
 
   // no need to wait for the retransmissions, or to try the second
-  natpmp_session_on_unreachable(session);
+  natpmp_session_on_host_unreachable(session);
   expect_failed(10, first);
   expect_failed(10, second);
   expect_idle(10);
@@ -351,12 +351,12 @@ static void test_session_unreachable_before_sending() {
   begin();
 
   // nothing asked for
-  natpmp_session_on_unreachable(session);
+  natpmp_session_on_host_unreachable(session);
   expect_idle(0);
 
   // or nothing sent yet
   auto const handle = request();
-  natpmp_session_on_unreachable(session);
+  natpmp_session_on_host_unreachable(session);
   expect_failed(0, handle);
   expect_idle(0);
 
@@ -610,7 +610,7 @@ static void test_session_unreachable_after_answer() {
   receive(0, sizeof(map_response), map_response);
 
   // the answer stands, only what's still waiting fails
-  natpmp_session_on_unreachable(session);
+  natpmp_session_on_host_unreachable(session);
   expect_mapped(0, first);
   expect_failed(0, second);
   expect_timeout(0, renewal);

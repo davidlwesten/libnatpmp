@@ -98,7 +98,7 @@ receive(int fd, natpmp_session_t *session, natpmp_optional_time_ms_t deadline) {
   if (size == -1) {
     if (errno == ECONNREFUSED) {
       // an ICMP Port Unreachable, nothing listens on the gateway
-      natpmp_session_on_unreachable(session);
+      natpmp_session_on_host_unreachable(session);
     } else {
       perror("recv");
     }
