@@ -64,10 +64,10 @@ typedef struct natpmp_request {
 } natpmp_request_t;
 
 typedef struct natpmp_outgoing {
-  /// The QUEUED and SENT requests, in the order they were made or came up for
-  /// renewal. Only the head is ever SENT.
-  natpmp_request_t *queue;
-  /// For the request at the head of the queue
+  /// The request going out, with the QUEUED ones behind it through `next`, in
+  /// the order they were made or came up for renewal. Only it is ever SENT.
+  natpmp_request_t *request;
+  /// For `request`
   natpmp_retransmit_t retransmit;
   uint8_t data[NATPMP_MAP_REQUEST_MAX_SIZE];
 } natpmp_outgoing_t;
@@ -127,7 +127,7 @@ void natpmp_session_end(natpmp_session_t *session) {
 // puts the request at the back of the queue
 static void natpmp_outgoing_push(natpmp_outgoing_t *outgoing,
                                  natpmp_request_t *request) {
-  natpmp_request_t **last = &outgoing->queue;
+  natpmp_request_t **last = &outgoing->request;
   while (*last) {
     last = &(*last)->next;
   }
@@ -136,26 +136,26 @@ static void natpmp_outgoing_push(natpmp_outgoing_t *outgoing,
 }
 
 static void natpmp_outgoing_pop(natpmp_outgoing_t *outgoing) {
-  outgoing->queue = outgoing->queue->next;
+  outgoing->request = outgoing->request->next;
 }
 
 // the gateway is gone, so everything still waiting fails with the head
 static void natpmp_outgoing_fail_all(natpmp_outgoing_t *outgoing) {
-  while (outgoing->queue) {
-    outgoing->queue->state = FAILED;
+  while (outgoing->request) {
+    outgoing->request->state = FAILED;
     natpmp_outgoing_pop(outgoing);
   }
 }
 
-// writes the head of the queue into `data` when it's due
+// writes `request` into `data` when it's due
 static natpmp_outgoing_status_t
 natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
   assert(outgoing);
 
-  auto const head = outgoing->queue;
-  assert(head);
+  auto const request = outgoing->request;
+  assert(request);
 
-  if (head->state == QUEUED) {
+  if (request->state == QUEUED) {
     // a new head, whose retransmissions start from scratch
     outgoing->retransmit = (natpmp_retransmit_t){};
   }
@@ -166,12 +166,13 @@ natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
   }
 
   view_t const dst = {.size = sizeof(outgoing->data), .data = outgoing->data};
-  auto const size = head->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS
-                        ? natpmp_packet_write_address_request(dst)
-                        : natpmp_packet_write_map_request(
-                              dst, head->opcode, head->map.internal_port,
-                              head->map.external_port, head->map.lifetime);
-  head->state = SENT;
+  auto const size =
+      request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS
+          ? natpmp_packet_write_address_request(dst)
+          : natpmp_packet_write_map_request(
+                dst, request->opcode, request->map.internal_port,
+                request->map.external_port, request->map.lifetime);
+  request->state = SENT;
   natpmp_retransmit_advance(&outgoing->retransmit, now);
   return (natpmp_outgoing_status_t){.status = NATPMP_RETRANSMIT_DUE,
                                     .size = size};
@@ -307,7 +308,7 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   // queue any renewals that are due, and if nothing is ready to send, return it
   // as the session's timeout
   auto const renewal = natpmp_session_renew(session, now);
-  if (!session->outgoing.queue) {
+  if (!session->outgoing.request) {
     return (natpmp_event_t){.type = NATPMP_EVENT_TIMEOUT,
                             .timeout = {.deadline = renewal}};
   }
@@ -390,19 +391,19 @@ static void natpmp_outgoing_on_datagram(natpmp_outgoing_t *outgoing,
   assert(outgoing);
   assert(data || size == 0);
 
-  auto const head = outgoing->queue;
-  if (!head || head->state != SENT) {
+  if (!outgoing->request || outgoing->request->state != SENT) {
     return;
   }
 
   auto const response =
       natpmp_packet_read_response((const_view_t){.size = size, .data = data});
-  if (!response.has_value || !natpmp_request_matches(head, &response.value)) {
+  if (!response.has_value ||
+      !natpmp_request_matches(outgoing->request, &response.value)) {
     // not an answer to the request on the wire
     return;
   }
 
-  natpmp_request_apply_answer(head, &response.value, now);
+  natpmp_request_apply_answer(outgoing->request, &response.value, now);
   natpmp_outgoing_pop(outgoing);
 }
 
