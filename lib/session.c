@@ -23,6 +23,9 @@
  *   SENT        -> FAILED    the gateway refuses it, or maps it for no time
  *   QUEUED/SENT -> FAILED    the head is given up on or the gateway can't be
  *                            reached, which fails everything queued
+ *   FREE/FAILED -> ANSWERED  the gateway announces a new external address, or
+ *                            answers with one too late, for the external
+ *                            address request
  *   ANSWERED    -> FREE      an external address request's answer is polled
  *   ANSWERED    -> ACTIVE    a mapping's answer is polled
  *   FAILED      -> FREE      its failure is polled
@@ -540,6 +543,19 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
   if (natpmp_gateway_update_epoch(&session->gateway, now,
                                   response.value.epoch)) {
     natpmp_session_recover(session, now);
+  }
+
+  // a repeat isn't news
+  if (response.value.type == NATPMP_RESPONSE_ADDRESS &&
+      natpmp_gateway_update_external_ip(&session->gateway,
+                                        response.value.address.external_ip)) {
+    // if the address request is waiting for an answer, let the gateway's
+    // response answer it. Otherwise report the new address to the application.
+    auto const request = &session->address_request;
+    if (request->state != QUEUED && request->state != SENT) {
+      request->state = ANSWERED;
+      request->external_ip = response.value.address.external_ip;
+    }
   }
 
   natpmp_outgoing_on_response(&session->outgoing, now, &response.value);

@@ -44,7 +44,6 @@ static natpmp_handle_t map(natpmp_protocol_t protocol) {
   return handle.value;
 }
 
-// with the epoch replaced, if `data` is long enough to carry one
 static void receive_epoch(natpmp_time_ms_t now,
                           uint32_t epoch,
                           size_t size,
@@ -72,6 +71,12 @@ static uint8_t const address_response[] = {
     0,   128, 0,   0,  // version, R + EXTERNAL_ADDRESS, SUCCESS
     0,   0,   0,   10, // epoch
     203, 0,   113, 7,
+};
+
+static uint8_t const other_address_response[] = {
+    0,   128, 0,   0,  // version, R + EXTERNAL_ADDRESS, SUCCESS
+    0,   0,   0,   10, // epoch
+    198, 51,  100, 1,
 };
 
 static uint8_t const address_error[] = {
@@ -145,12 +150,22 @@ static void expect_idle(natpmp_time_ms_t now) {
   TEST_ASSERT_FALSE(event.timeout.deadline.has_value);
 }
 
-static void expect_address(natpmp_time_ms_t now) {
+static void expect_external_ip(natpmp_time_ms_t now,
+                               uint8_t const external_ip[4]) {
   auto const event = natpmp_session_poll(session, now);
   TEST_ASSERT_EQUAL(NATPMP_EVENT_ADDRESS, event.type);
-  uint8_t const external_ip[] = {203, 0, 113, 7};
   TEST_ASSERT_EQUAL_UINT8_ARRAY(external_ip, event.address.external_ip.octets,
-                                sizeof(external_ip));
+                                4);
+}
+
+// the one address_response gives
+static void expect_address(natpmp_time_ms_t now) {
+  expect_external_ip(now, (uint8_t const[]){203, 0, 113, 7});
+}
+
+// the one other_address_response gives
+static void expect_other_address(natpmp_time_ms_t now) {
+  expect_external_ip(now, (uint8_t const[]){198, 51, 100, 1});
 }
 
 static void expect_mapped(natpmp_time_ms_t now, natpmp_handle_t handle) {
@@ -278,11 +293,7 @@ static void test_session_refused() {
 static void test_session_ignores_other_responses() {
   begin();
 
-  // nothing asked for
-  receive(0, sizeof(address_response), address_response);
-  expect_idle(0);
-
-  // or nothing sent yet
+  // nothing sent yet
   request();
   receive(0, sizeof(address_response), address_response);
   expect_send(0);
@@ -481,9 +492,10 @@ static void test_session_map_ignores_other_responses() {
   map(NATPMP_PROTOCOL_TCP);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
 
-  // for the external address
+  // for the external address, which is only news
   receive(0, sizeof(address_response), address_response);
   receive(0, sizeof(address_error), address_error);
+  expect_address(0);
 
   // for UDP
   uint8_t udp_response[sizeof(map_response)];
@@ -850,6 +862,7 @@ static void test_session_epoch_reboot() {
   // picks the longest delay
   random_value = 5000;
   receive_epoch(60'000, 1, sizeof(address_response), address_response);
+  expect_address(60'000);
   expect_timeout(60'000, 65'000);
   expect_sent(65'000, sizeof(map_tcp_renewal), map_tcp_renewal);
   receive_epoch(65'000, 2, sizeof(map_response), map_response);
@@ -867,6 +880,7 @@ static void test_session_epoch_answered() {
   // granted, but not reported yet
   random_value = 1000;
   receive_epoch(60'000, 1, sizeof(address_response), address_response);
+  expect_address(60'000);
   expect_mapped(60'000, handle);
   expect_timeout(60'000, 61'000);
   natpmp_session_end(session);
@@ -908,7 +922,109 @@ static void test_session_epoch_without_random() {
   // renews right away
   random_fails = true;
   receive_epoch(60'000, 1, sizeof(address_response), address_response);
+  expect_address(60'000);
   expect_sent(60'000, sizeof(map_tcp_renewal), map_tcp_renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_announced() {
+  begin();
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0);
+  expect_idle(0);
+  natpmp_session_end(session);
+}
+
+static void test_session_announced_once() {
+  begin();
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0);
+
+  // the gateway repeats it
+  receive(250, sizeof(address_response), address_response);
+  expect_idle(250);
+
+  // but every change is news
+  receive(1000, sizeof(other_address_response), other_address_response);
+  expect_other_address(1000);
+  receive(2000, sizeof(address_response), address_response);
+  expect_address(2000);
+  natpmp_session_end(session);
+}
+
+static void test_session_announced_after_answer() {
+  begin();
+  request();
+  expect_send(0);
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0);
+
+  // nothing new
+  receive(10, sizeof(address_response), address_response);
+  expect_idle(10);
+  natpmp_session_end(session);
+}
+
+static void test_session_announced_while_queued() {
+  begin();
+  auto const mapping = map(NATPMP_PROTOCOL_TCP);
+  request();
+  expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
+
+  // not reported until the request's answer reports it
+  receive(10, sizeof(other_address_response), other_address_response);
+  expect_timeout(10, 250);
+  receive(20, sizeof(map_response), map_response);
+  expect_mapped(20, mapping);
+  expect_send(20);
+  receive(30, sizeof(other_address_response), other_address_response);
+  expect_other_address(30);
+  expect_timeout(30, 20 + renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_answered_late() {
+  begin();
+  request();
+  expect_send(0);
+  receive(0, sizeof(address_response), address_response);
+  expect_address(0);
+
+  // a retransmission's answer, with an address that changed in between
+  receive(250, sizeof(other_address_response), other_address_response);
+  expect_other_address(250);
+  expect_idle(250);
+  natpmp_session_end(session);
+}
+
+static void test_session_announced_replaces() {
+  begin();
+  request();
+  expect_send(0);
+  receive(0, sizeof(address_response), address_response);
+
+  // an answer not reported yet
+  receive(10, sizeof(other_address_response), other_address_response);
+  expect_other_address(10);
+  expect_idle(10);
+
+  // or a failure
+  request();
+  natpmp_session_on_host_unreachable(session);
+  receive(20, sizeof(address_response), address_response);
+  expect_address(20);
+  expect_idle(20);
+  natpmp_session_end(session);
+}
+
+static void test_session_announcement_ignored() {
+  begin();
+
+  // not an address
+  receive(0, sizeof(address_error), address_error);
+  receive(0, sizeof(map_response), map_response);
+  receive(0, 3, address_response);
+  expect_idle(0);
   natpmp_session_end(session);
 }
 
@@ -991,6 +1107,13 @@ void session_tests() {
   RUN_TEST(test_session_epoch_answered);
   RUN_TEST(test_session_epoch_answers_after_reboot);
   RUN_TEST(test_session_epoch_without_random);
+  RUN_TEST(test_session_announced);
+  RUN_TEST(test_session_announced_once);
+  RUN_TEST(test_session_announced_after_answer);
+  RUN_TEST(test_session_announced_while_queued);
+  RUN_TEST(test_session_answered_late);
+  RUN_TEST(test_session_announced_replaces);
+  RUN_TEST(test_session_announcement_ignored);
   RUN_TEST(test_session_allocator);
   RUN_TEST(test_session_out_of_memory);
 }

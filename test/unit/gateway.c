@@ -60,10 +60,23 @@ static void test_gateway_epoch_large() {
   TEST_ASSERT_TRUE(natpmp_gateway_update_epoch(&gateway, 200'000, 0));
 }
 
+static void test_gateway_external_ip() {
+  natpmp_gateway_t gateway = {};
+  natpmp_ipv4_address_t const first = {{203, 0, 113, 7}};
+  natpmp_ipv4_address_t const second = {{203, 0, 113, 8}};
+
+  // the first one is news, a repeat isn't, and a change is again
+  TEST_ASSERT_TRUE(natpmp_gateway_update_external_ip(&gateway, first));
+  TEST_ASSERT_FALSE(natpmp_gateway_update_external_ip(&gateway, first));
+  TEST_ASSERT_TRUE(natpmp_gateway_update_external_ip(&gateway, second));
+  TEST_ASSERT_TRUE(natpmp_gateway_update_external_ip(&gateway, first));
+}
+
 void gateway_tests() {
   RUN_TEST(test_gateway_epoch_first_response);
   RUN_TEST(test_gateway_epoch_keeps_pace);
   RUN_TEST(test_gateway_epoch_tolerance);
   RUN_TEST(test_gateway_epoch_from_last_response);
   RUN_TEST(test_gateway_epoch_large);
+  RUN_TEST(test_gateway_external_ip);
 }

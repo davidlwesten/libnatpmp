@@ -145,7 +145,9 @@ typedef struct natpmp_event {
   enum {
     /// Send the request described by `send` to the gateway
     NATPMP_EVENT_SEND,
-    /// The gateway's external address is `address.external_ip`
+    /// The gateway's external address is `address.external_ip`, answering
+    /// natpmp_session_address_request or announced by the gateway (see
+    /// natpmp_session_on_datagram)
     NATPMP_EVENT_ADDRESS,
     /// The gateway refused the external address request, didn't answer, or
     /// couldn't be reached
@@ -206,6 +208,11 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
 
 /**
  * @brief Hand a datagram received from the gateway to the session
+ *
+ * Both its answers and its announcements to 224.0.0.1:5350, where it tells of a
+ * new external address or that it restarted. Only hand over datagrams from the
+ * gateway's own address. A new address is reported as NATPMP_EVENT_ADDRESS,
+ * the gateway repeating it isn't.
  *
  * The application should poll the session afterwards, see natpmp_session_poll.
  *
