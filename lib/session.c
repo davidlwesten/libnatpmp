@@ -2,6 +2,7 @@
 
 #include "gateway.h"
 #include "packet.h"
+#include "request.h"
 #include "retransmit.h"
 
 #include <assert.h>
@@ -10,163 +11,6 @@
 
 #define ALLOC(allocator, ...) (allocator.alloc(allocator.ctx, __VA_ARGS__))
 #define FREE(allocator, ...) (allocator.free(allocator.ctx, __VA_ARGS__))
-
-/**
- * @brief A request, from when it's made until its last event
- *
- * Mappings live in the session's slots, and the external address request in
- * the session itself. Each moves through these states:
- *
- *   FREE        -> QUEUED    a request is made in it
- *   QUEUED      -> SENT      it's at the head of the queue and goes out
- *   SENT        -> ANSWERED  the gateway answers it
- *   SENT        -> FAILED    the gateway refuses it, or maps it for no time
- *   QUEUED/SENT -> FAILED    the head is given up on or the gateway can't be
- *                            reached, which fails everything queued
- *   FREE/FAILED -> ANSWERED  the gateway announces a new external address, or
- *                            answers with one too late, for the external
- *                            address request
- *   ANSWERED    -> FREE      an external address request's answer is polled
- *   ANSWERED    -> ACTIVE    a mapping's answer is polled
- *   FAILED      -> FREE      its failure is polled
- *   ACTIVE      -> QUEUED    `map.renew_at` passes, and it joins the back of
- *                            the queue
- *
- * Releasing a mapping makes it ask for its deletion, and frees it without an
- * event once that's answered, refused or given up on. A QUEUED one keeps its
- * place in the queue:
- *
- *   ANSWERED/ACTIVE -> QUEUED  it joins the back of the queue
- *   SENT            -> QUEUED  it goes out again right away
- *   QUEUED/SENT     -> FREE    its deletion is done
- *   FAILED          -> FREE    right away, there's nothing to delete
- *
- * A request is in the queue exactly while it's QUEUED or SENT, and only the
- * head is ever SENT. It stays SENT while it's retransmitted.
- */
-typedef struct natpmp_request {
-  /// The request behind this one in the queue
-  struct natpmp_request *next;
-  natpmp_handle_t handle;
-  /// Which request this is, and so which member of the union is in use
-  enum natpmp_opcode opcode;
-  enum {
-    FREE,
-    /// Waiting to go out
-    QUEUED,
-    /// On the wire, waiting for the gateway's answer
-    SENT,
-    ANSWERED,
-    FAILED,
-    /// A mapping that was reported, until `map.renew_at`
-    ACTIVE,
-  } state;
-  union {
-    /// Once ANSWERED
-    natpmp_ipv4_address_t external_ip;
-    /// `external_port` and `lifetime` are asked for, then granted once
-    /// ANSWERED, and renewals ask for them again. Both are 0 once released.
-    struct {
-      natpmp_port_t internal_port;
-      natpmp_port_t external_port;
-      natpmp_time_s_t lifetime;
-      natpmp_time_ms_t renew_at;
-    } map;
-  };
-} natpmp_request_t;
-
-// a mapping asks for its deletion with lifetime 0, which it's never granted
-static bool natpmp_request_released(natpmp_request_t const *request) {
-  return request->opcode != NATPMP_OPCODE_EXTERNAL_ADDRESS &&
-         request->map.lifetime == 0;
-}
-
-// whether its last event is still to be polled
-static bool natpmp_request_done(natpmp_request_t const *request) {
-  return request->state == ANSWERED || request->state == FAILED;
-}
-
-// the event for a request that's done
-static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
-  assert(request);
-
-  if (request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
-    return request->state == FAILED
-               ? (natpmp_event_t){.type = NATPMP_EVENT_ADDRESS_FAILED}
-               : (natpmp_event_t){
-                     .type = NATPMP_EVENT_ADDRESS,
-                     .address = {.external_ip = request->external_ip},
-                 };
-  }
-
-  if (request->state == FAILED) {
-    return (natpmp_event_t){.type = NATPMP_EVENT_MAP_FAILED,
-                            .map_failed = {.handle = request->handle}};
-  }
-
-  return (natpmp_event_t){
-      .type = NATPMP_EVENT_MAPPED,
-      .mapped = {.handle = request->handle,
-                 .external_port = request->map.external_port,
-                 .lifetime = request->map.lifetime},
-  };
-}
-
-static bool natpmp_request_matches(natpmp_request_t const *request,
-                                   natpmp_response_t const *response) {
-  assert(request);
-  assert(response);
-
-  switch (response->type) {
-  case NATPMP_RESPONSE_ERROR:
-    return response->error.opcode == request->opcode;
-  case NATPMP_RESPONSE_ADDRESS:
-    return request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS;
-  case NATPMP_RESPONSE_MAP:
-    // a released mapping waits for its deletion, not a late grant
-    return response->map.opcode == request->opcode &&
-           response->map.internal_port == request->map.internal_port &&
-           (!natpmp_request_released(request) || response->map.lifetime == 0);
-  }
-  unreachable();
-}
-
-static void natpmp_request_apply_answer(natpmp_request_t *request,
-                                        natpmp_response_t const *response,
-                                        natpmp_time_ms_t now) {
-  assert(request);
-  assert(response);
-
-  if (natpmp_request_released(request)) {
-    // deleted, or refused and left to expire
-    request->state = FREE;
-    return;
-  }
-
-  switch (response->type) {
-  case NATPMP_RESPONSE_ERROR:
-    // refused, which only concerns this request
-    request->state = FAILED;
-    return;
-  case NATPMP_RESPONSE_ADDRESS:
-    request->state = ANSWERED;
-    request->external_ip = response->address.external_ip;
-    return;
-  case NATPMP_RESPONSE_MAP:
-    if (response->map.lifetime == 0) {
-      // there's no mapping, and renewing it would delete it
-      request->state = FAILED;
-      return;
-    }
-    request->state = ANSWERED;
-    request->map.external_port = response->map.external_port;
-    request->map.lifetime = response->map.lifetime;
-    // halfway through the lifetime
-    request->map.renew_at =
-        now + (natpmp_time_ms_t)response->map.lifetime * 500;
-    return;
-  }
-}
 
 typedef struct natpmp_outgoing {
   /// The request going out, with the QUEUED ones behind it through `next`, in
@@ -202,8 +46,9 @@ static void natpmp_outgoing_pop(natpmp_outgoing_t *outgoing) {
 static void natpmp_outgoing_fail_all(natpmp_outgoing_t *outgoing) {
   while (outgoing->request) {
     // a released mapping just expires on the gateway
-    outgoing->request->state =
-        natpmp_request_released(outgoing->request) ? FREE : FAILED;
+    outgoing->request->state = natpmp_request_released(outgoing->request)
+                                   ? NATPMP_REQUEST_FREE
+                                   : NATPMP_REQUEST_FAILED;
     natpmp_outgoing_pop(outgoing);
   }
 }
@@ -216,7 +61,7 @@ natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
   auto const request = outgoing->request;
   assert(request);
 
-  if (request->state == QUEUED) {
+  if (request->state == NATPMP_REQUEST_QUEUED) {
     // a new head, whose retransmissions start from scratch
     outgoing->retransmit = (natpmp_retransmit_t){};
   }
@@ -233,7 +78,7 @@ natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
           : natpmp_packet_write_map_request(
                 dst, request->opcode, request->map.internal_port,
                 request->map.external_port, request->map.lifetime);
-  request->state = SENT;
+  request->state = NATPMP_REQUEST_SENT;
   natpmp_retransmit_advance(&outgoing->retransmit, now);
   return (natpmp_outgoing_status_t){.status = NATPMP_RETRANSMIT_DUE,
                                     .size = size};
@@ -246,7 +91,7 @@ static void natpmp_outgoing_on_response(natpmp_outgoing_t *outgoing,
   assert(outgoing);
   assert(response);
 
-  if (!outgoing->request || outgoing->request->state != SENT ||
+  if (!outgoing->request || outgoing->request->state != NATPMP_REQUEST_SENT ||
       !natpmp_request_matches(outgoing->request, response)) {
     return;
   }
@@ -294,12 +139,12 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config) {
     *session = (natpmp_session_t){
         .config = config,
         .address_request = {.opcode = NATPMP_OPCODE_EXTERNAL_ADDRESS,
-                            .state = FREE},
+                            .state = NATPMP_REQUEST_FREE},
     };
     auto const begin = session->map_requests;
     auto const end = begin + config.capacity;
     for (auto request = begin; request != end; ++request) {
-      *request = (natpmp_request_t){.state = FREE};
+      *request = (natpmp_request_t){.state = NATPMP_REQUEST_FREE};
     }
   }
 
@@ -316,9 +161,9 @@ static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
   auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto slot = begin; slot != end; ++slot) {
-    if (slot->state == FREE) {
+    if (slot->state == NATPMP_REQUEST_FREE) {
       request.handle = ++session->handles;
-      request.state = QUEUED;
+      request.state = NATPMP_REQUEST_QUEUED;
       *slot = request;
       natpmp_outgoing_push(&session->outgoing, slot);
       return (natpmp_handle_or_error_t){.has_value = true,
@@ -332,12 +177,12 @@ static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
 void natpmp_session_address_request(natpmp_session_t *session) {
   assert(session);
 
-  if (session->address_request.state != FREE) {
+  if (session->address_request.state != NATPMP_REQUEST_FREE) {
     // the earlier request's event answers this one too
     return;
   }
 
-  session->address_request.state = QUEUED;
+  session->address_request.state = NATPMP_REQUEST_QUEUED;
   natpmp_outgoing_push(&session->outgoing, &session->address_request);
 }
 
@@ -372,7 +217,7 @@ static natpmp_request_t *natpmp_session_find(natpmp_session_t *session,
   auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
-    if (request->state != FREE && request->handle == handle) {
+    if (request->state != NATPMP_REQUEST_FREE && request->handle == handle) {
       return request;
     }
   }
@@ -393,24 +238,24 @@ void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle) {
   request->map.lifetime = 0;
 
   switch (request->state) {
-  case FREE:
+  case NATPMP_REQUEST_FREE:
     // natpmp_session_find skips free slots
     unreachable();
-  case QUEUED:
+  case NATPMP_REQUEST_QUEUED:
     // goes out as a deletion when its turn comes
     return;
-  case SENT:
+  case NATPMP_REQUEST_SENT:
     // still the head, and goes out again right away as a deletion
-    request->state = QUEUED;
+    request->state = NATPMP_REQUEST_QUEUED;
     return;
-  case ANSWERED:
-  case ACTIVE:
-    request->state = QUEUED;
+  case NATPMP_REQUEST_ANSWERED:
+  case NATPMP_REQUEST_ACTIVE:
+    request->state = NATPMP_REQUEST_QUEUED;
     natpmp_outgoing_push(&session->outgoing, request);
     return;
-  case FAILED:
+  case NATPMP_REQUEST_FAILED:
     // there's nothing to delete, and its failure goes unreported
-    request->state = FREE;
+    request->state = NATPMP_REQUEST_FREE;
     return;
   }
 }
@@ -445,12 +290,12 @@ static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
   auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
-    if (request->state != ACTIVE) {
+    if (request->state != NATPMP_REQUEST_ACTIVE) {
       continue;
     }
 
     if (request->map.renew_at <= now) {
-      request->state = QUEUED;
+      request->state = NATPMP_REQUEST_QUEUED;
       natpmp_outgoing_push(&session->outgoing, request);
     } else if (!next.has_value || request->map.renew_at < next.value) {
       next = (natpmp_optional_time_ms_t){.has_value = true,
@@ -469,7 +314,8 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   auto const done = natpmp_session_done(session);
   if (done) {
     auto const event = natpmp_request_event(done);
-    done->state = event.type == NATPMP_EVENT_MAPPED ? ACTIVE : FREE;
+    done->state = event.type == NATPMP_EVENT_MAPPED ? NATPMP_REQUEST_ACTIVE
+                                                    : NATPMP_REQUEST_FREE;
     return event;
   }
 
@@ -519,7 +365,8 @@ static void natpmp_session_recover(natpmp_session_t *session,
   auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
-    if (request->state == ANSWERED || request->state == ACTIVE) {
+    if (request->state == NATPMP_REQUEST_ANSWERED ||
+        request->state == NATPMP_REQUEST_ACTIVE) {
       request->map.renew_at = renew_at;
     }
   }
@@ -552,8 +399,9 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
     // if the address request is waiting for an answer, let the gateway's
     // response answer it. Otherwise report the new address to the application.
     auto const request = &session->address_request;
-    if (request->state != QUEUED && request->state != SENT) {
-      request->state = ANSWERED;
+    if (request->state != NATPMP_REQUEST_QUEUED &&
+        request->state != NATPMP_REQUEST_SENT) {
+      request->state = NATPMP_REQUEST_ANSWERED;
       request->external_ip = response.value.address.external_ip;
     }
   }

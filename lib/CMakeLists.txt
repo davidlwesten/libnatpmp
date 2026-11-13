@@ -9,6 +9,7 @@ function(natpmp_add_library target)
     PRIVATE
       gateway.c
       packet.c
+      request.c
       retransmit.c
       session.c
       natpmp_gen.c)
