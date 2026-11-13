@@ -5,6 +5,8 @@ void tearDown() {}
 
 extern void gateway_tests();
 extern void packet_tests();
+extern void queue_tests();
+extern void request_tests();
 extern void retransmit_tests();
 extern void session_tests();
 
@@ -17,6 +19,8 @@ int main(int argc, char *argv[]) {
 
   gateway_tests();
   packet_tests();
+  queue_tests();
+  request_tests();
   retransmit_tests();
   session_tests();
 
