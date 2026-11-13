@@ -80,9 +80,11 @@ bool natpmp_request_released(natpmp_request_t const *request);
 bool natpmp_request_done(natpmp_request_t const *request);
 
 /**
- * @brief The event for a request that's done
+ * @brief The event for a request that's done, which moves it on
+ *
+ * A mapping that was granted becomes ACTIVE, anything else FREE.
  */
-natpmp_event_t natpmp_request_event(natpmp_request_t const *request);
+natpmp_event_t natpmp_request_take_event(natpmp_request_t *request);
 
 bool natpmp_request_matches(natpmp_request_t const *request,
                             natpmp_response_t const *response);
@@ -90,3 +92,19 @@ bool natpmp_request_matches(natpmp_request_t const *request,
 void natpmp_request_apply_answer(natpmp_request_t *request,
                                  natpmp_response_t const *response,
                                  natpmp_time_ms_t now);
+
+/**
+ * @brief Give up on it, the gateway won't answer
+ *
+ * A released mapping is freed, since it just expires on the gateway.
+ */
+void natpmp_request_fail(natpmp_request_t *request);
+
+/**
+ * @brief Make a mapping in use ask for its deletion
+ *
+ * Ignored if it was already released.
+ *
+ * @returns Whether it has to join the queue
+ */
+bool natpmp_request_release(natpmp_request_t *request);

@@ -12,7 +12,8 @@ bool natpmp_request_done(natpmp_request_t const *request) {
          request->state == NATPMP_REQUEST_FAILED;
 }
 
-natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
+// the event for a request that's done
+static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   assert(request);
 
   if (request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
@@ -35,6 +36,16 @@ natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
                  .external_port = request->map.external_port,
                  .lifetime = request->map.lifetime},
   };
+}
+
+natpmp_event_t natpmp_request_take_event(natpmp_request_t *request) {
+  assert(request);
+  assert(natpmp_request_done(request));
+
+  auto const event = natpmp_request_event(request);
+  request->state = event.type == NATPMP_EVENT_MAPPED ? NATPMP_REQUEST_ACTIVE
+                                                     : NATPMP_REQUEST_FREE;
+  return event;
 }
 
 bool natpmp_request_matches(natpmp_request_t const *request,
@@ -91,4 +102,44 @@ void natpmp_request_apply_answer(natpmp_request_t *request,
         now + (natpmp_time_ms_t)response->map.lifetime * 500;
     return;
   }
+}
+
+void natpmp_request_fail(natpmp_request_t *request) {
+  assert(request);
+  request->state = natpmp_request_released(request) ? NATPMP_REQUEST_FREE
+                                                    : NATPMP_REQUEST_FAILED;
+}
+
+bool natpmp_request_release(natpmp_request_t *request) {
+  assert(request);
+  assert(request->opcode != NATPMP_OPCODE_EXTERNAL_ADDRESS);
+
+  if (natpmp_request_released(request)) {
+    return false;
+  }
+
+  // what a deletion asks for
+  request->map.external_port = 0;
+  request->map.lifetime = 0;
+
+  switch (request->state) {
+  case NATPMP_REQUEST_FREE:
+    // not in use
+    unreachable();
+  case NATPMP_REQUEST_QUEUED:
+    // goes out as a deletion when its turn comes
+    return false;
+  case NATPMP_REQUEST_SENT:
+    // still the head, and goes out again right away as a deletion
+    request->state = NATPMP_REQUEST_QUEUED;
+    return false;
+  case NATPMP_REQUEST_ANSWERED:
+  case NATPMP_REQUEST_ACTIVE:
+    return true;
+  case NATPMP_REQUEST_FAILED:
+    // there's nothing to delete, and its failure goes unreported
+    request->state = NATPMP_REQUEST_FREE;
+    return false;
+  }
+  unreachable();
 }

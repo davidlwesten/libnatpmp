@@ -76,7 +76,6 @@ static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
   for (auto slot = begin; slot != end; ++slot) {
     if (slot->state == NATPMP_REQUEST_FREE) {
       request.handle = ++session->handles;
-      request.state = NATPMP_REQUEST_QUEUED;
       *slot = request;
       natpmp_queue_push(&session->outgoing, slot);
       return (natpmp_handle_or_error_t){.has_value = true,
@@ -95,7 +94,6 @@ void natpmp_session_address_request(natpmp_session_t *session) {
     return;
   }
 
-  session->address_request.state = NATPMP_REQUEST_QUEUED;
   natpmp_queue_push(&session->outgoing, &session->address_request);
 }
 
@@ -142,34 +140,8 @@ void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle) {
   assert(session);
 
   auto const request = natpmp_session_find(session, handle);
-  if (!request || natpmp_request_released(request)) {
-    return;
-  }
-
-  // what a deletion asks for
-  request->map.external_port = 0;
-  request->map.lifetime = 0;
-
-  switch (request->state) {
-  case NATPMP_REQUEST_FREE:
-    // natpmp_session_find skips free slots
-    unreachable();
-  case NATPMP_REQUEST_QUEUED:
-    // goes out as a deletion when its turn comes
-    return;
-  case NATPMP_REQUEST_SENT:
-    // still the head, and goes out again right away as a deletion
-    request->state = NATPMP_REQUEST_QUEUED;
-    return;
-  case NATPMP_REQUEST_ANSWERED:
-  case NATPMP_REQUEST_ACTIVE:
-    request->state = NATPMP_REQUEST_QUEUED;
+  if (request && natpmp_request_release(request)) {
     natpmp_queue_push(&session->outgoing, request);
-    return;
-  case NATPMP_REQUEST_FAILED:
-    // there's nothing to delete, and its failure goes unreported
-    request->state = NATPMP_REQUEST_FREE;
-    return;
   }
 }
 
@@ -208,7 +180,6 @@ static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
     }
 
     if (request->map.renew_at <= now) {
-      request->state = NATPMP_REQUEST_QUEUED;
       natpmp_queue_push(&session->outgoing, request);
     } else if (!next.has_value || request->map.renew_at < next.value) {
       next = (natpmp_optional_time_ms_t){.has_value = true,
@@ -226,10 +197,7 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   // report what's answered or failed before sending anything
   auto const done = natpmp_session_done(session);
   if (done) {
-    auto const event = natpmp_request_event(done);
-    done->state = event.type == NATPMP_EVENT_MAPPED ? NATPMP_REQUEST_ACTIVE
-                                                    : NATPMP_REQUEST_FREE;
-    return event;
+    return natpmp_request_take_event(done);
   }
 
   // queue any renewals that are due, and if nothing is ready to send, return it

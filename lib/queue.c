@@ -3,10 +3,16 @@
 #include <assert.h>
 
 void natpmp_queue_push(natpmp_queue_t *queue, natpmp_request_t *request) {
+  assert(queue);
+  assert(request);
+  assert(request->state != NATPMP_REQUEST_QUEUED &&
+         request->state != NATPMP_REQUEST_SENT);
+
   natpmp_request_t **last = &queue->head;
   while (*last) {
     last = &(*last)->next;
   }
+  request->state = NATPMP_REQUEST_QUEUED;
   request->next = nullptr;
   *last = request;
 }
@@ -17,10 +23,7 @@ static void natpmp_queue_pop(natpmp_queue_t *queue) {
 
 void natpmp_queue_fail_all(natpmp_queue_t *queue) {
   while (queue->head) {
-    // a released mapping just expires on the gateway
-    queue->head->state = natpmp_request_released(queue->head)
-                             ? NATPMP_REQUEST_FREE
-                             : NATPMP_REQUEST_FAILED;
+    natpmp_request_fail(queue->head);
     natpmp_queue_pop(queue);
   }
 }
