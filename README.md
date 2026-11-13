@@ -37,7 +37,7 @@ datagram or the deadline:
 natpmp_session_t *session =
     natpmp_session_begin((natpmp_config_t){.rng = {.fill = fill_random}});
 
-auto const address = natpmp_session_address_request(session);
+natpmp_session_address_request(session);
 // TCP port 8080, for an hour, preferably on the same external port
 auto const mapping =
     natpmp_session_map_request(session, 3600, NATPMP_PROTOCOL_TCP, 8080, 8080);
@@ -52,12 +52,13 @@ while (running) {
       send(socket, event.send.data, event.send.size, 0);
       break;
     case NATPMP_EVENT_ADDRESS:
-      // event.address.handle answered with event.address.external_ip
+      // the gateway's external address is event.address.external_ip
       break;
     case NATPMP_EVENT_MAPPED:
       // event.mapped.handle got event.mapped.external_port for
       // event.mapped.lifetime seconds, again after every renewal
       break;
+    case NATPMP_EVENT_ADDRESS_FAILED:
     case NATPMP_EVENT_FAILED:
     case NATPMP_EVENT_TIMEOUT:
       break;

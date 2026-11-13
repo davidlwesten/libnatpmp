@@ -12,9 +12,10 @@
 #define FREE(allocator, ...) (allocator.free(allocator.ctx, __VA_ARGS__))
 
 /**
- * @brief A request, kept in its slot from when it's made until its last event
+ * @brief A request, from when it's made until its last event
  *
- * A slot moves through these states:
+ * Mappings live in the session's slots, and the external address request in
+ * the session itself. Each moves through these states:
  *
  *   FREE        -> QUEUED    a request is made in it
  *   QUEUED      -> SENT      it's at the head of the queue and goes out
@@ -77,21 +78,27 @@ static bool natpmp_request_released(natpmp_request_t const *request) {
          request->map.lifetime == 0;
 }
 
+// whether its last event is still to be polled
+static bool natpmp_request_done(natpmp_request_t const *request) {
+  return request->state == ANSWERED || request->state == FAILED;
+}
+
 // the event for a request that's done
 static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   assert(request);
 
+  if (request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
+    return request->state == FAILED
+               ? (natpmp_event_t){.type = NATPMP_EVENT_ADDRESS_FAILED}
+               : (natpmp_event_t){
+                     .type = NATPMP_EVENT_ADDRESS,
+                     .address = {.external_ip = request->external_ip},
+                 };
+  }
+
   if (request->state == FAILED) {
     return (natpmp_event_t){.type = NATPMP_EVENT_FAILED,
                             .failed = {.handle = request->handle}};
-  }
-
-  if (request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS) {
-    return (natpmp_event_t){
-        .type = NATPMP_EVENT_ADDRESS,
-        .address = {.handle = request->handle,
-                    .external_ip = request->external_ip},
-    };
   }
 
   return (natpmp_event_t){
@@ -252,9 +259,11 @@ struct natpmp_session {
   natpmp_handle_t handles;
   natpmp_gateway_t gateway;
   natpmp_outgoing_t outgoing;
-  /// `config.capacity` slots, each request kept until its last event is
-  /// polled, and each mapping until it fails or its deletion is done
-  natpmp_request_t requests[];
+  /// Shared by every caller until its event is polled
+  natpmp_request_t address_request;
+  /// `config.capacity` slots for mappings, each kept until its failure is
+  /// polled or its deletion is done
+  natpmp_request_t map_requests[];
 };
 
 static void *natpmp_default_alloc(void * /*ctx*/, size_t size) {
@@ -279,8 +288,12 @@ natpmp_session_t *natpmp_session_begin(natpmp_config_t config) {
       ALLOC(config.allocator, sizeof(natpmp_session_t) +
                                   config.capacity * sizeof(natpmp_request_t));
   if (session) {
-    *session = (natpmp_session_t){.config = config};
-    auto const begin = session->requests;
+    *session = (natpmp_session_t){
+        .config = config,
+        .address_request = {.opcode = NATPMP_OPCODE_EXTERNAL_ADDRESS,
+                            .state = FREE},
+    };
+    auto const begin = session->map_requests;
     auto const end = begin + config.capacity;
     for (auto request = begin; request != end; ++request) {
       *request = (natpmp_request_t){.state = FREE};
@@ -297,7 +310,7 @@ void natpmp_session_end(natpmp_session_t *session) {
 
 static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
                                                    natpmp_request_t request) {
-  auto const begin = session->requests;
+  auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto slot = begin; slot != end; ++slot) {
     if (slot->state == FREE) {
@@ -313,11 +326,16 @@ static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
   return (natpmp_handle_or_error_t){.has_value = false, .error = ENOBUFS};
 }
 
-natpmp_handle_or_error_t
-natpmp_session_address_request(natpmp_session_t *session) {
+void natpmp_session_address_request(natpmp_session_t *session) {
   assert(session);
-  return natpmp_session_add(
-      session, (natpmp_request_t){.opcode = NATPMP_OPCODE_EXTERNAL_ADDRESS});
+
+  if (session->address_request.state != FREE) {
+    // the earlier request's event answers this one too
+    return;
+  }
+
+  session->address_request.state = QUEUED;
+  natpmp_outgoing_push(&session->outgoing, &session->address_request);
 }
 
 natpmp_handle_or_error_t
@@ -348,7 +366,7 @@ static natpmp_request_t *natpmp_session_find(natpmp_session_t *session,
                                              natpmp_handle_t handle) {
   assert(session);
 
-  auto const begin = session->requests;
+  auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
     if (request->state != FREE && request->handle == handle) {
@@ -363,8 +381,7 @@ void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle) {
   assert(session);
 
   auto const request = natpmp_session_find(session, handle);
-  if (!request || request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS ||
-      natpmp_request_released(request)) {
+  if (!request || natpmp_request_released(request)) {
     return;
   }
 
@@ -399,10 +416,14 @@ void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle) {
 static natpmp_request_t *natpmp_session_done(natpmp_session_t *session) {
   assert(session);
 
-  auto const begin = session->requests;
+  if (natpmp_request_done(&session->address_request)) {
+    return &session->address_request;
+  }
+
+  auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
-    if (request->state == ANSWERED || request->state == FAILED) {
+    if (natpmp_request_done(request)) {
       return request;
     }
   }
@@ -418,7 +439,7 @@ static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
 
   natpmp_optional_time_ms_t next = {};
 
-  auto const begin = session->requests;
+  auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
     if (request->state != ACTIVE) {
@@ -492,11 +513,10 @@ static void natpmp_session_recover(natpmp_session_t *session,
   }
   auto const renew_at = now + random % 5001;
 
-  auto const begin = session->requests;
+  auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
-    if (request->opcode != NATPMP_OPCODE_EXTERNAL_ADDRESS &&
-        (request->state == ANSWERED || request->state == ACTIVE)) {
+    if (request->state == ANSWERED || request->state == ACTIVE) {
       request->map.renew_at = renew_at;
     }
   }

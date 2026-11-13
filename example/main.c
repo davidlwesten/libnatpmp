@@ -160,12 +160,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  auto const address = natpmp_session_address_request(session);
-  if (!address.has_value) {
-    fprintf(stderr, "natpmp_session_address_request: %s\n",
-            strerror(address.error));
-    return EXIT_FAILURE;
-  }
+  natpmp_session_address_request(session);
   int waiting = 1;
 
   if (map) {
@@ -201,12 +196,13 @@ int main(int argc, char *argv[]) {
              event.mapped.external_port, event.mapped.lifetime);
       waiting -= 1;
       break;
+    case NATPMP_EVENT_ADDRESS_FAILED:
+      fprintf(stderr, "the gateway didn't give its external address\n");
+      status = EXIT_FAILURE;
+      waiting -= 1;
+      break;
     case NATPMP_EVENT_FAILED:
-      if (event.failed.handle == address.value) {
-        fprintf(stderr, "the gateway didn't give its external address\n");
-      } else {
-        fprintf(stderr, "the gateway didn't map %s %u\n", argv[2], port);
-      }
+      fprintf(stderr, "the gateway didn't map %s %u\n", argv[2], port);
       status = EXIT_FAILURE;
       waiting -= 1;
       break;

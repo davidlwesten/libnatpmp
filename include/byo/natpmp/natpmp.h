@@ -81,17 +81,15 @@ typedef struct natpmp_handle_or_error {
 /**
  * @brief Ask the gateway for its external address
  *
- * Answered by NATPMP_EVENT_ADDRESS or NATPMP_EVENT_FAILED. Requests go to the
- * gateway one at a time, in the order they were made.
+ * Answered by NATPMP_EVENT_ADDRESS or NATPMP_EVENT_ADDRESS_FAILED. Does nothing
+ * while an earlier request is still waiting for its event, which then answers
+ * both. Requests go to the gateway one at a time, in the order they were made.
  *
  * The application should poll the session afterwards, see natpmp_session_poll.
  *
- * @param[in] session The session that owns this request
- *
- * @returns The handle, or an error (ENOBUFS if the session is at capacity)
+ * @param[in] session The session to ask
  */
-natpmp_handle_or_error_t
-natpmp_session_address_request(natpmp_session_t *session);
+void natpmp_session_address_request(natpmp_session_t *session);
 
 typedef enum natpmp_protocol {
   NATPMP_PROTOCOL_TCP = 6,
@@ -132,8 +130,8 @@ natpmp_session_map_request(natpmp_session_t *session,
  * invalid after this and no more events will refer to it.
  *
  * @param[in] session The session that owns the mapping
- * @param[in] handle  The mapping to release. Ignored if it was already
- *                    released or failed, or isn't a mapping.
+ * @param[in] handle  The mapping to release. Ignored if it's unknown, or was
+ *                    already released or failed.
  */
 void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle);
 
@@ -147,14 +145,16 @@ typedef struct natpmp_event {
   enum {
     /// Send the request described by `send` to the gateway
     NATPMP_EVENT_SEND,
-    /// The gateway's external address is `address.external_ip`. This is the
-    /// last event for the handle.
+    /// The gateway's external address is `address.external_ip`
     NATPMP_EVENT_ADDRESS,
+    /// The gateway refused the external address request, didn't answer, or
+    /// couldn't be reached
+    NATPMP_EVENT_ADDRESS_FAILED,
     /// Each time the gateway grants the mapping: `mapped.external_port` to the
     /// internal port for `mapped.lifetime` seconds. Both can differ from what
     /// was asked for.
     NATPMP_EVENT_MAPPED,
-    /// The gateway refused the request, didn't answer, or couldn't be reached.
+    /// The gateway refused the mapping, didn't answer, or couldn't be reached.
     /// This is the last event for the handle.
     NATPMP_EVENT_FAILED,
     /// Nothing more to do before `timeout.deadline`, see natpmp_session_poll
@@ -169,7 +169,6 @@ typedef struct natpmp_event {
       uint8_t const *data;
     } send;
     struct {
-      natpmp_handle_t handle;
       natpmp_ipv4_address_t external_ip;
     } address;
     struct {
