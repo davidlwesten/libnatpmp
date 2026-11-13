@@ -2,6 +2,7 @@
 
 #include "gateway.h"
 #include "packet.h"
+#include "queue.h"
 #include "request.h"
 #include "retransmit.h"
 
@@ -12,101 +13,13 @@
 #define ALLOC(allocator, ...) (allocator.alloc(allocator.ctx, __VA_ARGS__))
 #define FREE(allocator, ...) (allocator.free(allocator.ctx, __VA_ARGS__))
 
-typedef struct natpmp_outgoing {
-  /// The request going out, with the QUEUED ones behind it through `next`, in
-  /// the order they were made or came up for renewal. Only it is ever SENT.
-  natpmp_request_t *request;
-  /// For `request`
-  natpmp_retransmit_t retransmit;
-  uint8_t data[NATPMP_MAP_REQUEST_MAX_SIZE];
-} natpmp_outgoing_t;
-
-typedef struct natpmp_outgoing_status {
-  natpmp_retransmit_status_t status;
-  /// How much of `data` to send, when DUE
-  size_t size;
-} natpmp_outgoing_status_t;
-
-// puts the request at the back of the queue
-static void natpmp_outgoing_push(natpmp_outgoing_t *outgoing,
-                                 natpmp_request_t *request) {
-  natpmp_request_t **last = &outgoing->request;
-  while (*last) {
-    last = &(*last)->next;
-  }
-  request->next = nullptr;
-  *last = request;
-}
-
-static void natpmp_outgoing_pop(natpmp_outgoing_t *outgoing) {
-  outgoing->request = outgoing->request->next;
-}
-
-// the gateway is gone, so everything still waiting fails with the head
-static void natpmp_outgoing_fail_all(natpmp_outgoing_t *outgoing) {
-  while (outgoing->request) {
-    // a released mapping just expires on the gateway
-    outgoing->request->state = natpmp_request_released(outgoing->request)
-                                   ? NATPMP_REQUEST_FREE
-                                   : NATPMP_REQUEST_FAILED;
-    natpmp_outgoing_pop(outgoing);
-  }
-}
-
-// writes `request` into `data` when it's due
-static natpmp_outgoing_status_t
-natpmp_outgoing_poll(natpmp_outgoing_t *outgoing, natpmp_time_ms_t now) {
-  assert(outgoing);
-
-  auto const request = outgoing->request;
-  assert(request);
-
-  if (request->state == NATPMP_REQUEST_QUEUED) {
-    // a new head, whose retransmissions start from scratch
-    outgoing->retransmit = (natpmp_retransmit_t){};
-  }
-
-  auto const status = natpmp_retransmit_poll(&outgoing->retransmit, now);
-  if (status != NATPMP_RETRANSMIT_DUE) {
-    return (natpmp_outgoing_status_t){.status = status};
-  }
-
-  view_t const dst = {.size = sizeof(outgoing->data), .data = outgoing->data};
-  auto const size =
-      request->opcode == NATPMP_OPCODE_EXTERNAL_ADDRESS
-          ? natpmp_packet_write_address_request(dst)
-          : natpmp_packet_write_map_request(
-                dst, request->opcode, request->map.internal_port,
-                request->map.external_port, request->map.lifetime);
-  request->state = NATPMP_REQUEST_SENT;
-  natpmp_retransmit_advance(&outgoing->retransmit, now);
-  return (natpmp_outgoing_status_t){.status = NATPMP_RETRANSMIT_DUE,
-                                    .size = size};
-}
-
-// answers the request on the wire, if the response is for it
-static void natpmp_outgoing_on_response(natpmp_outgoing_t *outgoing,
-                                        natpmp_time_ms_t now,
-                                        natpmp_response_t const *response) {
-  assert(outgoing);
-  assert(response);
-
-  if (!outgoing->request || outgoing->request->state != NATPMP_REQUEST_SENT ||
-      !natpmp_request_matches(outgoing->request, response)) {
-    return;
-  }
-
-  natpmp_request_apply_answer(outgoing->request, response, now);
-  natpmp_outgoing_pop(outgoing);
-}
-
 static constexpr uint16_t NATPMP_DEFAULT_CAPACITY = 8;
 
 struct natpmp_session {
   natpmp_config_t config;
   natpmp_handle_t handles;
   natpmp_gateway_t gateway;
-  natpmp_outgoing_t outgoing;
+  natpmp_queue_t outgoing;
   /// Shared by every caller until its event is polled
   natpmp_request_t address_request;
   /// `config.capacity` slots for mappings, each kept until its failure is
@@ -165,7 +78,7 @@ static natpmp_handle_or_error_t natpmp_session_add(natpmp_session_t *session,
       request.handle = ++session->handles;
       request.state = NATPMP_REQUEST_QUEUED;
       *slot = request;
-      natpmp_outgoing_push(&session->outgoing, slot);
+      natpmp_queue_push(&session->outgoing, slot);
       return (natpmp_handle_or_error_t){.has_value = true,
                                         .value = request.handle};
     }
@@ -183,7 +96,7 @@ void natpmp_session_address_request(natpmp_session_t *session) {
   }
 
   session->address_request.state = NATPMP_REQUEST_QUEUED;
-  natpmp_outgoing_push(&session->outgoing, &session->address_request);
+  natpmp_queue_push(&session->outgoing, &session->address_request);
 }
 
 natpmp_handle_or_error_t
@@ -251,7 +164,7 @@ void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle) {
   case NATPMP_REQUEST_ANSWERED:
   case NATPMP_REQUEST_ACTIVE:
     request->state = NATPMP_REQUEST_QUEUED;
-    natpmp_outgoing_push(&session->outgoing, request);
+    natpmp_queue_push(&session->outgoing, request);
     return;
   case NATPMP_REQUEST_FAILED:
     // there's nothing to delete, and its failure goes unreported
@@ -296,7 +209,7 @@ static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
 
     if (request->map.renew_at <= now) {
       request->state = NATPMP_REQUEST_QUEUED;
-      natpmp_outgoing_push(&session->outgoing, request);
+      natpmp_queue_push(&session->outgoing, request);
     } else if (!next.has_value || request->map.renew_at < next.value) {
       next = (natpmp_optional_time_ms_t){.has_value = true,
                                          .value = request->map.renew_at};
@@ -322,13 +235,13 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   // queue any renewals that are due, and if nothing is ready to send, return it
   // as the session's timeout
   auto const renewal = natpmp_session_renew(session, now);
-  if (!session->outgoing.request) {
+  if (!session->outgoing.head) {
     return (natpmp_event_t){.type = NATPMP_EVENT_TIMEOUT,
                             .timeout = {.deadline = renewal}};
   }
 
   // send the head of the queue, or wait for its answer
-  auto const out = natpmp_outgoing_poll(&session->outgoing, now);
+  auto const out = natpmp_queue_poll(&session->outgoing, now);
   switch (out.status) {
   case NATPMP_RETRANSMIT_WAIT:
     return (natpmp_event_t){
@@ -342,7 +255,7 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
         .send = {.size = out.size, .data = session->outgoing.data},
     };
   case NATPMP_RETRANSMIT_GAVE_UP:
-    natpmp_outgoing_fail_all(&session->outgoing);
+    natpmp_queue_fail_all(&session->outgoing);
     // there are FAILED events to report now
     return natpmp_session_poll(session, now);
   }
@@ -406,10 +319,10 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
     }
   }
 
-  natpmp_outgoing_on_response(&session->outgoing, now, &response.value);
+  natpmp_queue_on_response(&session->outgoing, now, &response.value);
 }
 
 void natpmp_session_on_host_unreachable(natpmp_session_t *session) {
   assert(session);
-  natpmp_outgoing_fail_all(&session->outgoing);
+  natpmp_queue_fail_all(&session->outgoing);
 }
