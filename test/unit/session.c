@@ -182,10 +182,10 @@ static void expect_address_failed(natpmp_time_ms_t now) {
   TEST_ASSERT_EQUAL(NATPMP_EVENT_ADDRESS_FAILED, event.type);
 }
 
-static void expect_failed(natpmp_time_ms_t now, natpmp_handle_t handle) {
+static void expect_map_failed(natpmp_time_ms_t now, natpmp_handle_t handle) {
   auto const event = natpmp_session_poll(session, now);
-  TEST_ASSERT_EQUAL(NATPMP_EVENT_FAILED, event.type);
-  TEST_ASSERT_EQUAL_UINT16(handle, event.failed.handle);
+  TEST_ASSERT_EQUAL(NATPMP_EVENT_MAP_FAILED, event.type);
+  TEST_ASSERT_EQUAL_UINT16(handle, event.map_failed.handle);
 }
 
 // sends the request at the head of the queue nine times, without an answer
@@ -270,7 +270,7 @@ static void test_session_unanswered_fails_queued() {
 
   // the gateway is gone, no need to try the mapping
   expect_address_failed(now);
-  expect_failed(now, mapping);
+  expect_map_failed(now, mapping);
   expect_idle(now);
   natpmp_session_end(session);
 }
@@ -344,7 +344,7 @@ static void test_session_full() {
   TEST_ASSERT_FALSE(
       natpmp_session_map_request(session, 3600, NATPMP_PROTOCOL_TCP, 1, 0)
           .has_value);
-  expect_failed(0, first);
+  expect_map_failed(0, first);
   map(NATPMP_PROTOCOL_TCP);
   natpmp_session_end(session);
 }
@@ -369,7 +369,7 @@ static void test_session_reuses_slots() {
     auto const handle = map(NATPMP_PROTOCOL_TCP);
     expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
     receive(0, sizeof(map_error), map_error);
-    expect_failed(0, handle);
+    expect_map_failed(0, handle);
   }
   expect_idle(0);
   natpmp_session_end(session);
@@ -382,7 +382,7 @@ static void test_session_keeps_order() {
   auto const second = map(NATPMP_PROTOCOL_TCP);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
   receive(0, sizeof(map_error), map_error);
-  expect_failed(0, first);
+  expect_map_failed(0, first);
 
   // takes the first one's slot, but still goes out last
   auto const third = map(NATPMP_PROTOCOL_TCP);
@@ -405,7 +405,7 @@ static void test_session_unreachable() {
   // no need to wait for the retransmissions, or to try the mapping
   natpmp_session_on_host_unreachable(session);
   expect_address_failed(10);
-  expect_failed(10, mapping);
+  expect_map_failed(10, mapping);
   expect_idle(10);
   natpmp_session_end(session);
 }
@@ -480,7 +480,7 @@ static void test_session_map_refused() {
   receive(0, sizeof(map_error), map_error);
 
   // only the first, the second still gets its turn
-  expect_failed(0, first);
+  expect_map_failed(0, first);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
   receive(0, sizeof(map_response), map_response);
   expect_mapped(0, second);
@@ -547,8 +547,8 @@ static void test_session_map_unanswered_fails_queued() {
     now += 250 << i;
   }
 
-  expect_failed(now, first);
-  expect_failed(now, second);
+  expect_map_failed(now, first);
+  expect_map_failed(now, second);
   expect_idle(now);
   natpmp_session_end(session);
 }
@@ -562,7 +562,7 @@ static void test_session_map_zero_lifetime() {
   memcpy(zero_lifetime, map_response, sizeof(map_response));
   memset(&zero_lifetime[12], 0, 4);
   receive(0, sizeof(zero_lifetime), zero_lifetime);
-  expect_failed(0, handle);
+  expect_map_failed(0, handle);
   expect_idle(0);
   natpmp_session_end(session);
 }
@@ -614,7 +614,7 @@ static void test_session_renewal_behind_reused_slot() {
   expect_mapped(0, mapping);
   expect_sent(0, sizeof(map_tcp_request), map_tcp_request);
   receive(0, sizeof(map_error), map_error);
-  expect_failed(0, first);
+  expect_map_failed(0, first);
 
   // in the slot that was behind the mapping, and still waiting at the renewal
   auto const second = map(NATPMP_PROTOCOL_TCP);
@@ -641,7 +641,7 @@ static void test_session_renewal_refused() {
 
   expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
   receive(0, sizeof(map_error), map_error);
-  expect_failed(renewal, handle);
+  expect_map_failed(renewal, handle);
   expect_idle(renewal);
 
   // until it fails
@@ -660,7 +660,7 @@ static void test_session_renewal_unanswered() {
     expect_sent(now, sizeof(map_tcp_renewal), map_tcp_renewal);
     now += 250 << i;
   }
-  expect_failed(now, first);
+  expect_map_failed(now, first);
 
   // the other one isn't due yet, so it's left alone
   expect_timeout(now, 300 * 1000 + renewal);
@@ -678,7 +678,7 @@ static void test_session_unreachable_after_answer() {
   // the answer stands, only what's still waiting fails
   natpmp_session_on_host_unreachable(session);
   expect_mapped(0, first);
-  expect_failed(0, second);
+  expect_map_failed(0, second);
   expect_timeout(0, renewal);
   natpmp_session_end(session);
 }

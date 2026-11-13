@@ -99,11 +99,11 @@ typedef enum natpmp_protocol {
 /**
  * @brief Ask the gateway to map an external port to an internal one
  *
- * Answered by NATPMP_EVENT_MAPPED or NATPMP_EVENT_FAILED. Requests go to the
- * gateway one at a time, in the order they were made. The session renews the
- * mapping halfway through every lifetime the gateway grants, and within a few
- * seconds if the gateway loses it, with another NATPMP_EVENT_MAPPED each time,
- * until it fails or is released (see natpmp_session_release).
+ * Answered by NATPMP_EVENT_MAPPED or NATPMP_EVENT_MAP_FAILED. Requests go to
+ * the gateway one at a time, in the order they were made. The session renews
+ * the mapping halfway through every lifetime the gateway grants, and within a
+ * few seconds if the gateway loses it, with another NATPMP_EVENT_MAPPED each
+ * time, until it fails or is released (see natpmp_session_release).
  *
  * The application should poll the session afterwards, see natpmp_session_poll.
  *
@@ -158,7 +158,7 @@ typedef struct natpmp_event {
     NATPMP_EVENT_MAPPED,
     /// The gateway refused the mapping, didn't answer, or couldn't be reached.
     /// This is the last event for the handle.
-    NATPMP_EVENT_FAILED,
+    NATPMP_EVENT_MAP_FAILED,
     /// Nothing more to do before `timeout.deadline`, see natpmp_session_poll
     NATPMP_EVENT_TIMEOUT,
   } type;
@@ -180,7 +180,7 @@ typedef struct natpmp_event {
     } mapped;
     struct {
       natpmp_handle_t handle;
-    } failed;
+    } map_failed;
     struct {
       /// Always later than `now`. Empty if nothing is scheduled, in which case
       /// just wait for the next datagram.

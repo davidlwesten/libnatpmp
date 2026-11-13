@@ -201,7 +201,7 @@ int main(int argc, char *argv[]) {
       status = EXIT_FAILURE;
       waiting -= 1;
       break;
-    case NATPMP_EVENT_FAILED:
+    case NATPMP_EVENT_MAP_FAILED:
       fprintf(stderr, "the gateway didn't map %s %u\n", argv[2], port);
       status = EXIT_FAILURE;
       waiting -= 1;

@@ -59,7 +59,7 @@ while (running) {
       // event.mapped.lifetime seconds, again after every renewal
       break;
     case NATPMP_EVENT_ADDRESS_FAILED:
-    case NATPMP_EVENT_FAILED:
+    case NATPMP_EVENT_MAP_FAILED:
     case NATPMP_EVENT_TIMEOUT:
       break;
     }

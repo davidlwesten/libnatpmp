@@ -100,8 +100,8 @@ static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   }
 
   if (request->state == FAILED) {
-    return (natpmp_event_t){.type = NATPMP_EVENT_FAILED,
-                            .failed = {.handle = request->handle}};
+    return (natpmp_event_t){.type = NATPMP_EVENT_MAP_FAILED,
+                            .map_failed = {.handle = request->handle}};
   }
 
   return (natpmp_event_t){
