@@ -1,6 +1,6 @@
 #include <byo/natpmp/natpmp.h>
 
-#include "epoch.h"
+#include "gateway.h"
 #include "packet.h"
 #include "retransmit.h"
 
@@ -250,7 +250,7 @@ static constexpr uint16_t NATPMP_DEFAULT_CAPACITY = 8;
 struct natpmp_session {
   natpmp_config_t config;
   natpmp_handle_t handles;
-  natpmp_epoch_t epoch;
+  natpmp_gateway_t gateway;
   natpmp_outgoing_t outgoing;
   /// `config.capacity` slots, each request kept until its last event is
   /// polled, and each mapping until it fails or its deletion is done
@@ -517,7 +517,8 @@ void natpmp_session_on_datagram(natpmp_session_t *session,
 
   // the response still answers the request on the wire, which went to the
   // gateway as it is now, so only the mappings granted before it get renewed
-  if (natpmp_epoch_update(&session->epoch, now, response.value.epoch)) {
+  if (natpmp_gateway_update_epoch(&session->gateway, now,
+                                  response.value.epoch)) {
     natpmp_session_recover(session, now);
   }
 
