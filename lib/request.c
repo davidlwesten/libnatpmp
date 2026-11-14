@@ -12,7 +12,6 @@ bool natpmp_request_has_event(natpmp_request_t const *request) {
          request->state == NATPMP_REQUEST_FAILED;
 }
 
-// the event for a request that has one
 static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   assert(request);
 

@@ -24,9 +24,6 @@ typedef struct natpmp_queue_status {
   size_t size;
 } natpmp_queue_status_t;
 
-/**
- * @brief Put the request at the back of the queue
- */
 void natpmp_queue_push(natpmp_queue_t *queue, natpmp_request_t *request);
 
 /**

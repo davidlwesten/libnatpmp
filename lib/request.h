@@ -74,9 +74,6 @@ typedef struct natpmp_request {
  */
 bool natpmp_request_released(natpmp_request_t const *request);
 
-/**
- * @brief Whether its event is still to be polled
- */
 bool natpmp_request_has_event(natpmp_request_t const *request);
 
 /**

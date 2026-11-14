@@ -145,7 +145,6 @@ void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle) {
   }
 }
 
-// a request with an event to report, if any
 static natpmp_request_t *natpmp_session_find_event(natpmp_session_t *session) {
   assert(session);
 

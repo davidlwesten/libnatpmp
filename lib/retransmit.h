@@ -26,8 +26,5 @@ natpmp_retransmit_status_t
 natpmp_retransmit_poll(natpmp_retransmit_t const *retransmit,
                        natpmp_time_ms_t now);
 
-/**
- * @brief Record a transmission at `now`
- */
 void natpmp_retransmit_advance(natpmp_retransmit_t *retransmit,
                                natpmp_time_ms_t now);
