@@ -649,22 +649,75 @@ static void test_session_renewal_refused() {
   natpmp_session_end(session);
 }
 
-static void test_session_renewal_unanswered() {
-  begin();
-  auto const first = mapped(0);
-  mapped(300 * 1000);
-  expect_timeout(300 * 1000, renewal);
-
-  natpmp_time_ms_t now = renewal;
+// sends the renewal nine times from `now`, without an answer
+static natpmp_time_ms_t renewal_unanswered(natpmp_time_ms_t now) {
   for (int i = 0; i < 9; ++i) {
     expect_sent(now, sizeof(map_tcp_renewal), map_tcp_renewal);
     now += 250 << i;
   }
-  expect_map_failed(now, first);
+  return now;
+}
 
-  // the other one isn't due yet, so it's left alone
-  expect_timeout(now, 300 * 1000 + renewal);
-  expect_sent(300 * 1000 + renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+// when map_response's mapping expires, granted at 0
+static constexpr natpmp_time_ms_t expiry = 2 * renewal;
+
+static void test_session_renewal_unanswered() {
+  begin();
+  auto const handle = mapped(0);
+  auto const now = renewal_unanswered(renewal);
+
+  // the mapping is still there, so it tries again halfway to its expiry
+  auto const retry = renewal + renewal / 2;
+  expect_timeout(now, retry);
+  expect_sent(retry, sizeof(map_tcp_renewal), map_tcp_renewal);
+  receive(retry, sizeof(map_response), map_response);
+  expect_mapped(retry, handle);
+  expect_timeout(retry, retry + renewal);
+  natpmp_session_end(session);
+}
+
+static void test_session_renewal_unanswered_fails_queued() {
+  begin();
+  mapped(0);
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  auto const handle = map(NATPMP_PROTOCOL_TCP);
+  natpmp_time_ms_t now = renewal + 250;
+  for (int i = 1; i < 9; ++i) {
+    expect_sent(now, sizeof(map_tcp_renewal), map_tcp_renewal);
+    now += 250 << i;
+  }
+
+  // what was never granted fails, the renewal tries again later
+  expect_map_failed(now, handle);
+  expect_timeout(now, renewal + renewal / 2);
+  natpmp_session_end(session);
+}
+
+static void test_session_renewal_expires() {
+  begin();
+  auto const handle = mapped(0);
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  natpmp_session_on_host_unreachable(session);
+
+  // not polled again until it has expired
+  expect_map_failed(expiry, handle);
+  expect_idle(expiry);
+  natpmp_session_end(session);
+}
+
+static void test_session_expires_before_recovery() {
+  begin();
+  auto const handle = mapped(0);
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  natpmp_session_on_host_unreachable(session);
+
+  // the gateway reboots a second before the expiry, and the rng picks a renewal
+  // after it
+  random_value = 5000;
+  receive_epoch(expiry - 1000, 1, sizeof(address_response), address_response);
+  expect_address(expiry - 1000);
+  expect_timeout(expiry - 1000, expiry);
+  expect_map_failed(expiry, handle);
   natpmp_session_end(session);
 }
 
@@ -835,6 +888,20 @@ static void test_session_release_unreachable() {
   // left to expire on the gateway
   natpmp_session_on_host_unreachable(session);
   expect_idle(0);
+  natpmp_session_end(session);
+}
+
+static void test_session_release_retrying() {
+  begin();
+  auto const handle = mapped(0);
+  expect_sent(renewal, sizeof(map_tcp_renewal), map_tcp_renewal);
+  natpmp_session_on_host_unreachable(session);
+
+  // waiting to try the renewal again, and deleted right away instead
+  natpmp_session_release(session, handle);
+  expect_sent(renewal, sizeof(map_tcp_deletion), map_tcp_deletion);
+  receive(renewal, sizeof(deletion_response), deletion_response);
+  expect_idle(renewal);
   natpmp_session_end(session);
 }
 
@@ -1090,6 +1157,9 @@ void session_tests() {
   RUN_TEST(test_session_renewal_behind_reused_slot);
   RUN_TEST(test_session_renewal_refused);
   RUN_TEST(test_session_renewal_unanswered);
+  RUN_TEST(test_session_renewal_unanswered_fails_queued);
+  RUN_TEST(test_session_renewal_expires);
+  RUN_TEST(test_session_expires_before_recovery);
   RUN_TEST(test_session_unreachable_after_answer);
   RUN_TEST(test_session_reports_before_renewing);
   RUN_TEST(test_session_release);
@@ -1102,6 +1172,7 @@ void session_tests() {
   RUN_TEST(test_session_release_refused);
   RUN_TEST(test_session_release_unanswered);
   RUN_TEST(test_session_release_unreachable);
+  RUN_TEST(test_session_release_retrying);
   RUN_TEST(test_session_release_ignored);
   RUN_TEST(test_session_epoch_reboot);
   RUN_TEST(test_session_epoch_answered);

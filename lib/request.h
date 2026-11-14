@@ -15,6 +15,8 @@
  *   SENT        -> FAILED    the gateway refuses it, or maps it for no time
  *   QUEUED/SENT -> FAILED    the head is given up on or the gateway can't be
  *                            reached, which fails everything queued
+ *   QUEUED/SENT -> ACTIVE    the same, for a renewal, which tries again
+ *                            halfway to `map.expires_at`
  *   FREE/FAILED -> ANSWERED  the gateway announces a new external address, or
  *                            answers with one too late, for the external
  *                            address request
@@ -23,6 +25,7 @@
  *   FAILED      -> FREE      its failure is polled
  *   ACTIVE      -> QUEUED    `map.renew_at` passes, and it joins the back of
  *                            the queue
+ *   ACTIVE      -> FAILED    `map.expires_at` passes first
  *
  * Releasing a mapping makes it ask for its deletion, and frees it without an
  * event once that's answered, refused or given up on. A QUEUED one keeps its
@@ -63,6 +66,7 @@ typedef struct natpmp_request {
       natpmp_port_t external_port;
       natpmp_time_s_t lifetime;
       natpmp_time_ms_t renew_at;
+      natpmp_time_ms_t expires_at;
     } map;
   };
 } natpmp_request_t;
@@ -93,7 +97,8 @@ void natpmp_request_apply_answer(natpmp_request_t *request,
 /**
  * @brief Give up on it, the gateway won't answer
  *
- * A released mapping is freed, since it just expires on the gateway.
+ * A released mapping is freed, since it just expires on the gateway. A renewal
+ * is tried again later, since the mapping is still there until it expires.
  */
 void natpmp_request_fail(natpmp_request_t *request);
 

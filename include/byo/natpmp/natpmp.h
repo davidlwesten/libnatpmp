@@ -103,7 +103,9 @@ typedef enum natpmp_protocol {
  * the gateway one at a time, in the order they were made. The session renews
  * the mapping halfway through every lifetime the gateway grants, and within a
  * few seconds if the gateway loses it, with another NATPMP_EVENT_MAPPED each
- * time, until it fails or is released (see natpmp_session_release).
+ * time, until it fails or is released (see natpmp_session_release). A renewal
+ * the gateway doesn't answer is tried again halfway to the mapping's expiry,
+ * and the mapping only fails once it expires.
  *
  * The application should poll the session afterwards, see natpmp_session_poll.
  *
@@ -156,8 +158,9 @@ typedef struct natpmp_event {
     /// internal port for `mapped.lifetime` seconds. Both can differ from what
     /// was asked for.
     NATPMP_EVENT_MAPPED,
-    /// The gateway refused the mapping, didn't answer, or couldn't be reached.
-    /// This is the last event for the handle.
+    /// The gateway refused the mapping, didn't answer, or couldn't be reached,
+    /// or the mapping expired without being renewed. This is the last event
+    /// for the handle.
     NATPMP_EVENT_MAP_FAILED,
     /// Nothing more to do before `timeout.deadline`, see natpmp_session_poll
     NATPMP_EVENT_TIMEOUT,

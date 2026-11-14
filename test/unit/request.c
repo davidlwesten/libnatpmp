@@ -77,6 +77,7 @@ static void test_request_granted() {
   TEST_ASSERT_EQUAL_UINT32(7200, request.map.lifetime);
   // halfway through the lifetime
   TEST_ASSERT_EQUAL_UINT64(1000 + 3600 * 1000, request.map.renew_at);
+  TEST_ASSERT_EQUAL_UINT64(1000 + 7200 * 1000, request.map.expires_at);
 }
 
 static void test_request_refused() {
@@ -157,6 +158,23 @@ static void test_request_fail() {
   TEST_ASSERT_EQUAL(NATPMP_REQUEST_FREE, request.state);
 }
 
+static void test_request_fail_renewal() {
+  // tries again halfway to the expiry, and again after that
+  auto request = mapping(NATPMP_REQUEST_SENT);
+  request.map.renew_at = 4000;
+  request.map.expires_at = 8000;
+  natpmp_request_fail(&request);
+  TEST_ASSERT_EQUAL(NATPMP_REQUEST_ACTIVE, request.state);
+  TEST_ASSERT_EQUAL_UINT64(6000, request.map.renew_at);
+  natpmp_request_fail(&request);
+  TEST_ASSERT_EQUAL_UINT64(7000, request.map.renew_at);
+
+  // but a released one is still freed
+  request.map.lifetime = 0;
+  natpmp_request_fail(&request);
+  TEST_ASSERT_EQUAL(NATPMP_REQUEST_FREE, request.state);
+}
+
 static void test_request_release_asks_for_deletion() {
   auto request = mapping(NATPMP_REQUEST_ACTIVE);
   TEST_ASSERT_TRUE(natpmp_request_release(&request));
@@ -206,6 +224,7 @@ void request_tests() {
   RUN_TEST(test_request_mapped_stays_active);
   RUN_TEST(test_request_map_failed_frees);
   RUN_TEST(test_request_fail);
+  RUN_TEST(test_request_fail_renewal);
   RUN_TEST(test_request_release_asks_for_deletion);
   RUN_TEST(test_request_release_in_queue);
   RUN_TEST(test_request_release_failed);

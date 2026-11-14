@@ -163,7 +163,7 @@ static natpmp_request_t *natpmp_session_find_event(natpmp_session_t *session) {
   return nullptr;
 }
 
-// queues the mappings that are due for renewal, and returns when the next one
+// queues all mappings that are due for renewal, and returns when the next one
 // is due
 static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
                                                       natpmp_time_ms_t now) {
@@ -178,11 +178,22 @@ static natpmp_optional_time_ms_t natpmp_session_renew(natpmp_session_t *session,
       continue;
     }
 
+    if (request->map.expires_at <= now) {
+      request->state = NATPMP_REQUEST_FAILED;
+      continue;
+    }
+
     if (request->map.renew_at <= now) {
       natpmp_queue_push(&session->outgoing, request);
-    } else if (!next.has_value || request->map.renew_at < next.value) {
-      next = (natpmp_optional_time_ms_t){.has_value = true,
-                                         .value = request->map.renew_at};
+      continue;
+    }
+
+    // a gateway reboot can put the renewal past the expiry
+    auto const due = request->map.renew_at < request->map.expires_at
+                         ? request->map.renew_at
+                         : request->map.expires_at;
+    if (!next.has_value || due < next.value) {
+      next = (natpmp_optional_time_ms_t){.has_value = true, .value = due};
     }
   }
 
@@ -193,15 +204,15 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
                                    natpmp_time_ms_t now) {
   assert(session);
 
-  // report what's answered or failed before sending anything
+  // queue any renewals that are due, then report what's answered or failed
+  // before sending anything
+  auto const renewal = natpmp_session_renew(session, now);
   auto const request = natpmp_session_find_event(session);
   if (request) {
     return natpmp_request_take_event(request);
   }
 
-  // queue any renewals that are due, and if nothing is ready to send, return it
-  // as the session's timeout
-  auto const renewal = natpmp_session_renew(session, now);
+  // if nothing is ready to send, the next renewal is the session's timeout
   if (!session->outgoing.head) {
     return (natpmp_event_t){.type = NATPMP_EVENT_TIMEOUT,
                             .timeout = {.deadline = renewal}};
