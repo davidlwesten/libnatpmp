@@ -145,18 +145,18 @@ void natpmp_session_release(natpmp_session_t *session, natpmp_handle_t handle) {
   }
 }
 
-// a request whose last event is still to be polled, if any
-static natpmp_request_t *natpmp_session_done(natpmp_session_t *session) {
+// a request with an event to report, if any
+static natpmp_request_t *natpmp_session_find_event(natpmp_session_t *session) {
   assert(session);
 
-  if (natpmp_request_done(&session->address_request)) {
+  if (natpmp_request_has_event(&session->address_request)) {
     return &session->address_request;
   }
 
   auto const begin = session->map_requests;
   auto const end = begin + session->config.capacity;
   for (auto request = begin; request != end; ++request) {
-    if (natpmp_request_done(request)) {
+    if (natpmp_request_has_event(request)) {
       return request;
     }
   }
@@ -195,9 +195,9 @@ natpmp_event_t natpmp_session_poll(natpmp_session_t *session,
   assert(session);
 
   // report what's answered or failed before sending anything
-  auto const done = natpmp_session_done(session);
-  if (done) {
-    return natpmp_request_take_event(done);
+  auto const request = natpmp_session_find_event(session);
+  if (request) {
+    return natpmp_request_take_event(request);
   }
 
   // queue any renewals that are due, and if nothing is ready to send, return it

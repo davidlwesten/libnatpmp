@@ -75,12 +75,12 @@ typedef struct natpmp_request {
 bool natpmp_request_released(natpmp_request_t const *request);
 
 /**
- * @brief Whether its last event is still to be polled
+ * @brief Whether its event is still to be polled
  */
-bool natpmp_request_done(natpmp_request_t const *request);
+bool natpmp_request_has_event(natpmp_request_t const *request);
 
 /**
- * @brief The event for a request that's done, which moves it on
+ * @brief Take its event, which moves it on
  *
  * A mapping that was granted becomes ACTIVE, anything else FREE.
  */

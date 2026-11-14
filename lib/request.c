@@ -7,12 +7,12 @@ bool natpmp_request_released(natpmp_request_t const *request) {
          request->map.lifetime == 0;
 }
 
-bool natpmp_request_done(natpmp_request_t const *request) {
+bool natpmp_request_has_event(natpmp_request_t const *request) {
   return request->state == NATPMP_REQUEST_ANSWERED ||
          request->state == NATPMP_REQUEST_FAILED;
 }
 
-// the event for a request that's done
+// the event for a request that has one
 static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
   assert(request);
 
@@ -40,7 +40,7 @@ static natpmp_event_t natpmp_request_event(natpmp_request_t const *request) {
 
 natpmp_event_t natpmp_request_take_event(natpmp_request_t *request) {
   assert(request);
-  assert(natpmp_request_done(request));
+  assert(natpmp_request_has_event(request));
 
   auto const event = natpmp_request_event(request);
   request->state = event.type == NATPMP_EVENT_MAPPED ? NATPMP_REQUEST_ACTIVE
